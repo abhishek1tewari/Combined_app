@@ -553,6 +553,7 @@ def get_history(user_id, days=10):
 
     food_map = {r["day"]: float(r["consumed"] or 0) for r in food_rows}
     exercise_map = {r["day"]: float(r["burned"] or 0) for r in exercise_rows}
+    maintenance_calories = get_maintenance_calories(user_id)
     all_days = sorted(
         set(food_map) | set(exercise_map), reverse=True
     )[:days]
@@ -562,7 +563,10 @@ def get_history(user_id, days=10):
             "Date": day,
             "Calories consumed": food_map.get(day, 0),
             "Calories burned": exercise_map.get(day, 0),
-            "Net calories": food_map.get(day, 0) - exercise_map.get(day, 0)
+            "Net calories": (
+                food_map.get(day, 0)
+                - (maintenance_calories + exercise_map.get(day, 0))
+            )
         }
         for day in all_days
     ]
