@@ -13,7 +13,8 @@ from datetime import datetime, date, timedelta
 
 # ============================================================
 # MASTER APP: FOOD + EXERCISE + WEIGHT TRACKER
-# Includes date-to-date copying of food and exercise entries.
+# Includes date-to-date copying of food and exercise entries,
+# and protein / fat / carbohydrate tracking for food.
 # Run: streamlit run master.py
 # ============================================================
 
@@ -197,6 +198,17 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            # NEW: macronutrient columns. Added with ALTER so existing food
+            # rows are kept (they get 0 until you edit them).
+            for macro_col in (
+                "protein_per_100g", "fat_per_100g", "carbs_per_100g",
+                "protein_g", "fat_g", "carbs_g"
+            ):
+                cur.execute(f"""
+                    ALTER TABLE food_entries
+                    ADD COLUMN IF NOT EXISTS {macro_col}
+                    DOUBLE PRECISION NOT NULL DEFAULT 0
+                """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_food_user_date
                 ON food_entries(user_id, entry_date)
@@ -226,8 +238,8 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
-            # FIX: upgrade an older, differently-structured exercise_entries
-            # table so that all columns used by this app exist.
+            # Upgrade an older, differently-structured exercise_entries table
+            # so that all columns used by this app exist.
             migrate_exercise_table(cur)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_exercise_user_date
@@ -266,6 +278,15 @@ def init_db():
                     UNIQUE(user_id, entry_date)
                 )
             """)
+            # NEW: daily macro totals.
+            for macro_col in (
+                "protein_consumed", "fat_consumed", "carbs_consumed"
+            ):
+                cur.execute(f"""
+                    ALTER TABLE daily_summary
+                    ADD COLUMN IF NOT EXISTS {macro_col}
+                    DOUBLE PRECISION NOT NULL DEFAULT 0
+                """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_daily_summary_user_date
                 ON daily_summary(user_id, entry_date DESC)
@@ -386,19 +407,29 @@ def update_maintenance_calories(user_id, calories):
 
 # ============================================================
 # FOOD DATABASE FUNCTIONS - same food_entries schema as app.py
+# (plus protein / fat / carbs)
 # ============================================================
 def add_food(user_id, food_name, calories_per_100g, quantity_g,
              quantity_type="Grams (g)", unit_count=0, unit_weight=0,
-             source="Manual"):
+             source="Manual", protein_per_100g=0.0, fat_per_100g=0.0,
+             carbs_per_100g=0.0):
     quantity_g = float(quantity_g)
     calories_per_100g = float(calories_per_100g)
+    protein_per_100g = float(protein_per_100g or 0)
+    fat_per_100g = float(fat_per_100g or 0)
+    carbs_per_100g = float(carbs_per_100g or 0)
 
     if not food_name.strip():
         raise ValueError("Food name is required.")
     if quantity_g <= 0 or calories_per_100g < 0:
         raise ValueError("Quantity must be above zero and calories cannot be negative.")
+    if protein_per_100g < 0 or fat_per_100g < 0 or carbs_per_100g < 0:
+        raise ValueError("Protein, fat and carbs cannot be negative.")
 
     calories = calories_per_100g * quantity_g / 100
+    protein_g = protein_per_100g * quantity_g / 100
+    fat_g = fat_per_100g * quantity_g / 100
+    carbs_g = carbs_per_100g * quantity_g / 100
     now = datetime.now().isoformat(timespec="seconds")
 
     with get_connection() as conn:
@@ -406,12 +437,17 @@ def add_food(user_id, food_name, calories_per_100g, quantity_g,
             cur.execute("""
                 INSERT INTO food_entries
                 (user_id, food_name, calories_per_100g, quantity_g, calories,
-                 quantity_type, unit_count, unit_weight, entry_date, source, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 quantity_type, unit_count, unit_weight, entry_date, source, created_at,
+                 protein_per_100g, fat_per_100g, carbs_per_100g,
+                 protein_g, fat_g, carbs_g)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s)
             """, (
                 user_id, food_name.strip(), calories_per_100g, quantity_g,
                 calories, quantity_type, float(unit_count), float(unit_weight),
-                now, source, now
+                now, source, now,
+                protein_per_100g, fat_per_100g, carbs_per_100g,
+                protein_g, fat_g, carbs_g
             ))
 
 
@@ -437,16 +473,33 @@ def get_food_entries(user_id, selected_day=None):
 
 
 def update_food(user_id, food_id, quantity_g, quantity_type,
-                unit_count, unit_weight):
+                unit_count, unit_weight, protein_per_100g=None,
+                fat_per_100g=None, carbs_per_100g=None):
+    """Update quantity (and optionally the per-100 g macros) of an entry.
+    Calories and macro totals are recalculated from the per-100 g values."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT calories_per_100g
+                SELECT calories_per_100g, protein_per_100g,
+                       fat_per_100g, carbs_per_100g
                 FROM food_entries WHERE id=%s AND user_id=%s
             """, (food_id, user_id))
             row = cur.fetchone()
             if not row:
                 return False
+
+            p100 = float(
+                row["protein_per_100g"] if protein_per_100g is None
+                else protein_per_100g
+            )
+            f100 = float(
+                row["fat_per_100g"] if fat_per_100g is None
+                else fat_per_100g
+            )
+            c100 = float(
+                row["carbs_per_100g"] if carbs_per_100g is None
+                else carbs_per_100g
+            )
 
             calories = (
                 float(row["calories_per_100g"]) * float(quantity_g) / 100
@@ -454,11 +507,18 @@ def update_food(user_id, food_id, quantity_g, quantity_type,
             cur.execute("""
                 UPDATE food_entries
                 SET quantity_g=%s, calories=%s, quantity_type=%s,
-                    unit_count=%s, unit_weight=%s
+                    unit_count=%s, unit_weight=%s,
+                    protein_per_100g=%s, fat_per_100g=%s, carbs_per_100g=%s,
+                    protein_g=%s, fat_g=%s, carbs_g=%s
                 WHERE id=%s AND user_id=%s
             """, (
                 float(quantity_g), calories, quantity_type,
-                float(unit_count), float(unit_weight), food_id, user_id
+                float(unit_count), float(unit_weight),
+                p100, f100, c100,
+                p100 * float(quantity_g) / 100,
+                f100 * float(quantity_g) / 100,
+                c100 * float(quantity_g) / 100,
+                food_id, user_id
             ))
     return True
 
@@ -543,9 +603,13 @@ def copy_food_entry(user_id, food_id, destination_day):
             cur.execute("""
                 INSERT INTO food_entries
                 (user_id, food_name, calories_per_100g, quantity_g, calories,
-                 quantity_type, unit_count, unit_weight, entry_date, source, created_at)
+                 quantity_type, unit_count, unit_weight, entry_date, source, created_at,
+                 protein_per_100g, fat_per_100g, carbs_per_100g,
+                 protein_g, fat_g, carbs_g)
                 SELECT user_id, food_name, calories_per_100g, quantity_g, calories,
-                       quantity_type, unit_count, unit_weight, %s, source, %s
+                       quantity_type, unit_count, unit_weight, %s, source, %s,
+                       protein_per_100g, fat_per_100g, carbs_per_100g,
+                       protein_g, fat_g, carbs_g
                 FROM food_entries WHERE id=%s AND user_id=%s
             """, (destination_stamp, now, food_id, user_id))
             return cur.rowcount > 0
@@ -629,9 +693,13 @@ def copy_day_entries(user_id, source_day, destination_day):
             cur.execute("""
                 INSERT INTO food_entries
                 (user_id, food_name, calories_per_100g, quantity_g, calories,
-                 quantity_type, unit_count, unit_weight, entry_date, source, created_at)
+                 quantity_type, unit_count, unit_weight, entry_date, source, created_at,
+                 protein_per_100g, fat_per_100g, carbs_per_100g,
+                 protein_g, fat_g, carbs_g)
                 SELECT user_id, food_name, calories_per_100g, quantity_g, calories,
-                       quantity_type, unit_count, unit_weight, %s, source, %s
+                       quantity_type, unit_count, unit_weight, %s, source, %s,
+                       protein_per_100g, fat_per_100g, carbs_per_100g,
+                       protein_g, fat_g, carbs_g
                 FROM food_entries
                 WHERE user_id=%s AND entry_date >= %s AND entry_date < %s
             """, (destination_stamp, now, user_id, source_start, source_end))
@@ -655,8 +723,8 @@ def sync_daily_summary(user_id):
     """Refresh one database summary row per date from food, exercise and weight logs.
 
     Historical maintenance values are retained. The current date takes the
-    latest maintenance setting; consumed/burned/weight values are refreshed
-    from their source tables whenever the history is opened.
+    latest maintenance setting; consumed/burned/weight/macro values are
+    refreshed from their source tables whenever the history is opened.
     """
     maintenance = get_maintenance_calories(user_id)
     today = date.today()
@@ -665,7 +733,10 @@ def sync_daily_summary(user_id):
             cur.execute("""
                 WITH food AS (
                     SELECT SUBSTRING(entry_date FROM 1 FOR 10)::DATE AS day,
-                           COALESCE(SUM(calories), 0)::DOUBLE PRECISION AS consumed
+                           COALESCE(SUM(calories), 0)::DOUBLE PRECISION AS consumed,
+                           COALESCE(SUM(protein_g), 0)::DOUBLE PRECISION AS protein,
+                           COALESCE(SUM(fat_g), 0)::DOUBLE PRECISION AS fat,
+                           COALESCE(SUM(carbs_g), 0)::DOUBLE PRECISION AS carbs
                     FROM food_entries
                     WHERE user_id=%s
                     GROUP BY SUBSTRING(entry_date FROM 1 FOR 10)::DATE
@@ -693,13 +764,17 @@ def sync_daily_summary(user_id):
                 INSERT INTO daily_summary (
                     user_id, entry_date, maintenance_calories,
                     calories_consumed, calories_burned, current_weight,
-                    calorie_balance, updated_at
+                    calorie_balance, protein_consumed, fat_consumed,
+                    carbs_consumed, updated_at
                 )
                 SELECT %s, d.day, %s,
                        COALESCE(f.consumed, 0),
                        COALESCE(e.burned, 0),
                        w.weight_kg,
                        COALESCE(f.consumed, 0) - (%s + COALESCE(e.burned, 0)),
+                       COALESCE(f.protein, 0),
+                       COALESCE(f.fat, 0),
+                       COALESCE(f.carbs, 0),
                        CURRENT_TIMESTAMP
                 FROM all_days d
                 LEFT JOIN food f ON f.day=d.day
@@ -720,6 +795,9 @@ def sync_daily_summary(user_id):
                              ELSE daily_summary.maintenance_calories END
                         + EXCLUDED.calories_burned
                     ),
+                    protein_consumed=EXCLUDED.protein_consumed,
+                    fat_consumed=EXCLUDED.fat_consumed,
+                    carbs_consumed=EXCLUDED.carbs_consumed,
                     updated_at=CURRENT_TIMESTAMP
             """, (
                 user_id, user_id, user_id, user_id, today,
@@ -738,7 +816,10 @@ def get_history(user_id, days=10):
                        calories_consumed AS "Calories consumed",
                        calories_burned AS "Calories burned",
                        current_weight AS "Current weight (kg)",
-                       calorie_balance AS "Deficit / surplus"
+                       calorie_balance AS "Deficit / surplus",
+                       protein_consumed AS "Protein (g)",
+                       fat_consumed AS "Fat (g)",
+                       carbs_consumed AS "Carbs (g)"
                 FROM daily_summary
                 WHERE user_id=%s
                 ORDER BY entry_date DESC
@@ -803,6 +884,62 @@ def get_calories_from_nutrients(nutrients):
     return None
 
 
+def get_macros_from_nutrients(nutrients):
+    """Extract protein, total fat and carbohydrate (g per 100 g) from a
+    USDA foodNutrients list. Missing values are returned as 0.0.
+
+    USDA nutrient ids: protein 1003, total fat 1004, carbohydrate 1005.
+    """
+    macros = {"protein": None, "fat": None, "carbs": None}
+    id_map = {1003: "protein", 1004: "fat", 1005: "carbs"}
+
+    for nutrient in nutrients:
+        nutrient_info = nutrient.get("nutrient", {})
+        nutrient_id = (
+            nutrient.get("nutrientId")
+            or nutrient.get("nutrientNumber")
+            or nutrient_info.get("id")
+        )
+        name = (
+            nutrient.get("nutrientName")
+            or nutrient_info.get("name")
+            or ""
+        ).lower()
+        unit = (
+            nutrient.get("unitName")
+            or nutrient_info.get("unitName")
+            or ""
+        ).lower()
+        value = nutrient.get("value")
+        if value is None:
+            value = nutrient.get("amount")
+
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value < 0 or (unit and unit != "g"):
+            continue
+
+        try:
+            nutrient_id = int(nutrient_id) if nutrient_id is not None else None
+        except (TypeError, ValueError):
+            nutrient_id = None
+
+        key = id_map.get(nutrient_id)
+        if key is None:
+            if name == "protein":
+                key = "protein"
+            elif name.startswith("total lipid") or name == "fat":
+                key = "fat"
+            elif name.startswith("carbohydrate, by difference"):
+                key = "carbs"
+        if key and macros[key] is None:
+            macros[key] = value
+
+    return {k: (v if v is not None else 0.0) for k, v in macros.items()}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def search_food_api(food_name, api_key):
     params = {
@@ -833,6 +970,10 @@ def search_food_api(food_name, api_key):
                 )
                 if calories is None or calories < 0:
                     continue
+
+                macros = get_macros_from_nutrients(
+                    product.get("foodNutrients", [])
+                )
 
                 name = (product.get("description") or "").strip()
                 if not name:
@@ -870,6 +1011,9 @@ def search_food_api(food_name, api_key):
                 results.append({
                     "name": name,
                     "calories": float(calories),
+                    "protein": float(macros["protein"]),
+                    "fat": float(macros["fat"]),
+                    "carbs": float(macros["carbs"]),
                     "brand": (
                         product.get("brandOwner")
                         or product.get("brandName")
@@ -1158,6 +1302,15 @@ consumed_today = sum(
 burned_today = sum(
     float(row["calories_burned"]) for row in dashboard_exercise
 )
+protein_today = sum(
+    float(row.get("protein_g") or 0) for row in dashboard_food
+)
+fat_today = sum(
+    float(row.get("fat_g") or 0) for row in dashboard_food
+)
+carbs_today = sum(
+    float(row.get("carbs_g") or 0) for row in dashboard_food
+)
 # Net calories after accounting for baseline maintenance and exercise.
 # Negative = calorie deficit; positive = calorie surplus.
 net_calories = consumed_today - (float(new_maintenance_calories) + burned_today)
@@ -1182,6 +1335,12 @@ m5.metric(
     delta=("Deficit" if calorie_deficit >= 0 else "Surplus"),
     delta_color="normal" if calorie_deficit >= 0 else "inverse"
 )
+
+# Macronutrients eaten on the selected date.
+mac1, mac2, mac3 = st.columns(3)
+mac1.metric("Protein", f"{protein_today:,.1f} g")
+mac2.metric("Fat", f"{fat_today:,.1f} g")
+mac3.metric("Carbohydrates", f"{carbs_today:,.1f} g")
 
 # Progress bar tracks the existing net-intake target (food minus exercise),
 # not the maintenance-based deficit/surplus figure shown above.
@@ -1242,7 +1401,8 @@ if food_method == "Search USDA Food Database":
             elif foods:
                 labels = [
                     f"{f['name']} | {f['brand'] or 'Generic'} | "
-                    f"{f['calories']:.1f} kcal / 100 g"
+                    f"{f['calories']:.1f} kcal / 100 g | "
+                    f"P {f['protein']:.1f} · F {f['fat']:.1f} · C {f['carbs']:.1f} g"
                     for f in foods
                 ]
                 selected_index = st.selectbox(
@@ -1281,6 +1441,31 @@ else:
             value=150.0,
             step=1.0
         )
+        mp_col, mf_col, mc_col = st.columns(3)
+        with mp_col:
+            manual_protein = st.number_input(
+                "Protein per 100 g (g)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5
+            )
+        with mf_col:
+            manual_fat = st.number_input(
+                "Fat per 100 g (g)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5
+            )
+        with mc_col:
+            manual_carbs = st.number_input(
+                "Carbs per 100 g (g)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5
+            )
         manual_submit = st.form_submit_button(
             "Continue to quantity"
         )
@@ -1292,6 +1477,9 @@ else:
             st.session_state.selected_food = {
                 "name": manual_name.strip(),
                 "calories": float(manual_calories),
+                "protein": float(manual_protein),
+                "fat": float(manual_fat),
+                "carbs": float(manual_carbs),
                 "brand": "Manual entry",
                 "serving_weight": None,
                 "serving_size": "User entered",
@@ -1307,6 +1495,9 @@ if selected_food is not None:
     st.markdown(f"**Selected food:** {selected_food['name']}")
     st.caption(
         f"{selected_food['calories']:.1f} kcal per 100 g · "
+        f"Protein {selected_food.get('protein', 0.0):.1f} g · "
+        f"Fat {selected_food.get('fat', 0.0):.1f} g · "
+        f"Carbs {selected_food.get('carbs', 0.0):.1f} g per 100 g · "
         f"{selected_food.get('source', 'Manual')}"
     )
 
@@ -1351,12 +1542,20 @@ if selected_food is not None:
     calculated_food_calories = (
         selected_food["calories"] * quantity_g / 100
     )
+    calculated_protein = selected_food.get("protein", 0.0) * quantity_g / 100
+    calculated_fat = selected_food.get("fat", 0.0) * quantity_g / 100
+    calculated_carbs = selected_food.get("carbs", 0.0) * quantity_g / 100
+
     fa, fb = st.columns(2)
     fa.metric("Total quantity", f"{quantity_g:.1f} g")
     fb.metric(
         "Calories for this quantity",
         f"{calculated_food_calories:.1f} kcal"
     )
+    fc, fd, fe = st.columns(3)
+    fc.metric("Protein", f"{calculated_protein:.1f} g")
+    fd.metric("Fat", f"{calculated_fat:.1f} g")
+    fe.metric("Carbs", f"{calculated_carbs:.1f} g")
 
     food_add_col, food_clear_col = st.columns(2)
 
@@ -1375,7 +1574,10 @@ if selected_food is not None:
                     quantity_type=quantity_type,
                     unit_count=unit_count,
                     unit_weight=unit_weight,
-                    source=selected_food.get("source", "Manual")
+                    source=selected_food.get("source", "Manual"),
+                    protein_per_100g=selected_food.get("protein", 0.0),
+                    fat_per_100g=selected_food.get("fat", 0.0),
+                    carbs_per_100g=selected_food.get("carbs", 0.0)
                 )
                 st.session_state.selected_food = None
                 st.success("Food added to your diary.")
@@ -1796,6 +1998,19 @@ if food_entries:
         f"Food calories on {food_diary_day.strftime('%d %b %Y')}",
         f"{sum(float(e['calories']) for e in food_entries):.1f} kcal"
     )
+    dm1, dm2, dm3 = st.columns(3)
+    dm1.metric(
+        "Protein",
+        f"{sum(float(e.get('protein_g') or 0) for e in food_entries):.1f} g"
+    )
+    dm2.metric(
+        "Fat",
+        f"{sum(float(e.get('fat_g') or 0) for e in food_entries):.1f} g"
+    )
+    dm3.metric(
+        "Carbs",
+        f"{sum(float(e.get('carbs_g') or 0) for e in food_entries):.1f} g"
+    )
 
     for entry in food_entries:
         title = (
@@ -1807,6 +2022,11 @@ if food_entries:
             st.caption(
                 f"Source: {entry['source']} · Added: "
                 f"{entry['created_at'][:16].replace('T', ' ')}"
+            )
+            st.write(
+                f"**Protein:** {float(entry.get('protein_g') or 0):.1f} g · "
+                f"**Fat:** {float(entry.get('fat_g') or 0):.1f} g · "
+                f"**Carbs:** {float(entry.get('carbs_g') or 0):.1f} g"
             )
 
             with st.form(f"edit_food_form_{entry['id']}"):
@@ -1847,6 +2067,39 @@ if food_entries:
                     key=f"edit_food_weight_{entry['id']}"
                 )
 
+                st.caption(
+                    "Macros per 100 g (use this to fill in protein, fat and "
+                    "carbs for entries logged before macros were tracked)."
+                )
+                em1, em2, em3 = st.columns(3)
+                with em1:
+                    edit_protein100 = st.number_input(
+                        "Protein / 100 g",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(entry.get("protein_per_100g") or 0),
+                        step=0.5,
+                        key=f"edit_food_protein_{entry['id']}"
+                    )
+                with em2:
+                    edit_fat100 = st.number_input(
+                        "Fat / 100 g",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(entry.get("fat_per_100g") or 0),
+                        step=0.5,
+                        key=f"edit_food_fat_{entry['id']}"
+                    )
+                with em3:
+                    edit_carbs100 = st.number_input(
+                        "Carbs / 100 g",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(entry.get("carbs_per_100g") or 0),
+                        step=0.5,
+                        key=f"edit_food_carbs_{entry['id']}"
+                    )
+
                 save_food_edit = st.form_submit_button(
                     "Save quantity changes"
                 )
@@ -1861,14 +2114,16 @@ if food_entries:
                         final_qty = edit_count * edit_weight
                         update_food(
                             user_id, entry["id"], final_qty,
-                            edit_type, edit_count, edit_weight
+                            edit_type, edit_count, edit_weight,
+                            edit_protein100, edit_fat100, edit_carbs100
                         )
                         st.success("Food quantity updated.")
                         st.rerun()
                 else:
                     update_food(
                         user_id, entry["id"], edit_quantity,
-                        edit_type, 0, 0
+                        edit_type, 0, 0,
+                        edit_protein100, edit_fat100, edit_carbs100
                     )
                     st.success("Food quantity updated.")
                     st.rerun()
@@ -2076,7 +2331,8 @@ if history:
     history_df = pd.DataFrame(history)
     for col in [
         "Maintenance calories", "Calories consumed", "Calories burned",
-        "Current weight (kg)", "Deficit / surplus"
+        "Current weight (kg)", "Deficit / surplus",
+        "Protein (g)", "Fat (g)", "Carbs (g)"
     ]:
         history_df[col] = pd.to_numeric(history_df[col], errors="coerce").round(1)
 
@@ -2090,6 +2346,12 @@ if history:
         ["Maintenance calories", "Calories consumed", "Calories burned", "Deficit / surplus"]
     ]
     st.bar_chart(chart_df)
+
+    st.caption("Daily macronutrients (g)")
+    macro_chart_df = history_df.set_index("Date")[
+        ["Protein (g)", "Fat (g)", "Carbs (g)"]
+    ]
+    st.bar_chart(macro_chart_df)
 else:
     st.info("Your combined food and exercise history will appear here.")
 
