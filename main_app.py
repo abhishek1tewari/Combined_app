@@ -14,7 +14,8 @@ from datetime import datetime, date, timedelta
 # ============================================================
 # MASTER APP: FOOD + EXERCISE + WEIGHT TRACKER
 # Includes date-to-date copying of food and exercise entries,
-# and protein / fat / carbohydrate tracking for food.
+# protein / fat / carbohydrate tracking for food, and import of
+# macros from older food_entries columns.
 # Run: streamlit run master.py
 # ============================================================
 
@@ -27,6 +28,18 @@ st.set_page_config(
 USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 NINJAS_EXERCISES_URL = "https://api.api-ninjas.com/v1/exercises"
 NINJAS_CALORIES_URL = "https://api.api-ninjas.com/v1/caloriesburned"
+
+# Set to True if your OLD macro columns hold values per 100 g.
+# Leave False if they hold the total grams for the logged quantity.
+# (Old columns with "100" in the name are always treated as per 100 g.)
+LEGACY_MACROS_ARE_PER_100G = False
+
+LEGACY_MACRO_NAMES = {
+    "protein": ["protein", "proteins", "protein_100g", "protein_grams"],
+    "fat": ["fat", "fats", "total_fat", "fat_100g", "fat_grams"],
+    "carbs": ["carbs", "carb", "carbohydrate", "carbohydrates",
+              "carbs_100g", "carbohydrates_100g", "carbs_grams"],
+}
 
 
 # ============================================================
@@ -154,6 +167,87 @@ def migrate_exercise_table(cur):
         """)
 
 
+def migrate_food_macros(cur):
+    """Copy protein/fat/carbs from legacy food_entries columns (if any) into
+    the new macro columns. Only rows whose new macros are all zero are
+    touched, so it is safe to run on every start."""
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'food_entries'
+    """)
+    existing = {r["column_name"] for r in cur.fetchall()}
+
+    def safe_num(col):
+        # Tolerates legacy columns stored as TEXT or containing junk.
+        return (
+            "(CASE WHEN \"" + col + "\"::TEXT ~ '^[0-9]+(\\.[0-9]+)?$' "
+            "THEN \"" + col + "\"::TEXT::DOUBLE PRECISION ELSE 0 END)"
+        )
+
+    targets = (
+        ("protein", "protein_per_100g", "protein_g"),
+        ("fat", "fat_per_100g", "fat_g"),
+        ("carbs", "carbs_per_100g", "carbs_g"),
+    )
+    for macro, per100_col, total_col in targets:
+        legacy = next(
+            (c for c in LEGACY_MACRO_NAMES[macro] if c in existing), None
+        )
+        if not legacy:
+            continue
+        value = safe_num(legacy)
+        if LEGACY_MACROS_ARE_PER_100G or "100" in legacy:
+            cur.execute(f"""
+                UPDATE food_entries
+                SET {per100_col} = {value},
+                    {total_col} = {value} * quantity_g / 100
+                WHERE {per100_col} = 0 AND {total_col} = 0
+            """)
+        else:
+            cur.execute(f"""
+                UPDATE food_entries
+                SET {total_col} = {value},
+                    {per100_col} = CASE WHEN quantity_g > 0
+                                        THEN {value} * 100 / quantity_g
+                                        ELSE 0 END
+                WHERE {per100_col} = 0 AND {total_col} = 0
+            """)
+
+
+def backfill_macros_from_history(user_id):
+    """For entries that still have no macros, reuse the macros of the most
+    recent entry with the same food name (case-insensitive) that has them.
+    Returns the number of rows updated."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE food_entries t
+                SET protein_per_100g = s.p,
+                    fat_per_100g = s.f,
+                    carbs_per_100g = s.c,
+                    protein_g = s.p * t.quantity_g / 100,
+                    fat_g = s.f * t.quantity_g / 100,
+                    carbs_g = s.c * t.quantity_g / 100
+                FROM (
+                    SELECT DISTINCT ON (user_id, LOWER(food_name))
+                           user_id, LOWER(food_name) AS fname,
+                           protein_per_100g AS p, fat_per_100g AS f,
+                           carbs_per_100g AS c
+                    FROM food_entries
+                    WHERE user_id = %s
+                      AND (protein_per_100g > 0 OR fat_per_100g > 0
+                           OR carbs_per_100g > 0)
+                    ORDER BY user_id, LOWER(food_name), id DESC
+                ) s
+                WHERE t.user_id = s.user_id
+                  AND LOWER(t.food_name) = s.fname
+                  AND t.protein_per_100g = 0
+                  AND t.fat_per_100g = 0
+                  AND t.carbs_per_100g = 0
+            """, (user_id,))
+            return cur.rowcount
+
+
 def init_db():
     """Create compatible food/user tables plus the new exercise table."""
     with get_connection() as conn:
@@ -198,8 +292,8 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
-            # NEW: macronutrient columns. Added with ALTER so existing food
-            # rows are kept (they get 0 until you edit them).
+            # Macronutrient columns. Added with ALTER so existing food
+            # rows are kept (they get 0 until imported or edited).
             for macro_col in (
                 "protein_per_100g", "fat_per_100g", "carbs_per_100g",
                 "protein_g", "fat_g", "carbs_g"
@@ -209,6 +303,8 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS {macro_col}
                     DOUBLE PRECISION NOT NULL DEFAULT 0
                 """)
+            # Import macros from older columns (protein, fat, carbs, ...).
+            migrate_food_macros(cur)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_food_user_date
                 ON food_entries(user_id, entry_date)
@@ -278,7 +374,7 @@ def init_db():
                     UNIQUE(user_id, entry_date)
                 )
             """)
-            # NEW: daily macro totals.
+            # Daily macro totals.
             for macro_col in (
                 "protein_consumed", "fat_consumed", "carbs_consumed"
             ):
@@ -1239,6 +1335,12 @@ with st.sidebar:
         help="Used for exercise search and calorie estimates."
     )
     st.caption("API Ninjas: https://api-ninjas.com/")
+
+    st.divider()
+    if st.button("Fill missing macros from my past entries",
+                 use_container_width=True):
+        filled = backfill_macros_from_history(user_id)
+        st.success(f"Updated {filled} food entries.")
 
     st.divider()
     st.caption(
