@@ -978,10 +978,15 @@ consumed_today = sum(
 burned_today = sum(
     float(row["calories_burned"]) for row in dashboard_exercise
 )
-net_calories = consumed_today - burned_today
-net_vs_target = net_calories - float(new_target)
-remaining = float(new_target) - net_calories
-calorie_deficit = float(new_maintenance_calories) + burned_today - consumed_today
+# Net calories after accounting for baseline maintenance and exercise.
+# Negative = calorie deficit; positive = calorie surplus.
+net_calories = consumed_today - (float(new_maintenance_calories) + burned_today)
+calorie_deficit = -net_calories
+
+# Keep the existing daily net-intake target calculation unchanged.
+net_intake = consumed_today - burned_today
+net_vs_target = net_intake - float(new_target)
+remaining = float(new_target) - net_intake
 
 st.divider()
 st.subheader(f"📊 Daily Dashboard — {dashboard_day.strftime('%d %b %Y')}")
@@ -998,9 +1003,11 @@ m5.metric(
     delta_color="normal" if calorie_deficit >= 0 else "inverse"
 )
 
+# Progress bar tracks the existing net-intake target (food minus exercise),
+# not the maintenance-based deficit/surplus figure shown above.
 progress = max(
     0.0,
-    min(net_calories / max(float(new_target), 1), 1.0)
+    min(net_intake / max(float(new_target), 1), 1.0)
 )
 st.progress(progress)
 
