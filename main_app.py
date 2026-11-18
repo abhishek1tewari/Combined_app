@@ -54,6 +54,105 @@ def get_connection():
         conn.close()
 
 
+def migrate_exercise_table(cur):
+    """
+    Bring a pre-existing exercise_entries table (created by an older version
+    of the app with a different layout) up to the current schema.
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so missing
+    columns must be added explicitly.
+    """
+    cur.execute("""
+        SELECT column_name, data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'exercise_entries'
+    """)
+    existing = {r["column_name"]: r for r in cur.fetchall()}
+    if not existing:
+        return
+
+    required_columns = {
+        "exercise_name": "TEXT NOT NULL DEFAULT ''",
+        "category": "TEXT NOT NULL DEFAULT 'Other'",
+        "duration_minutes": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "body_weight_kg": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "lifted_weight_kg": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "sets": "INTEGER NOT NULL DEFAULT 0",
+        "reps": "INTEGER NOT NULL DEFAULT 0",
+        "calories_burned": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "source": "TEXT NOT NULL DEFAULT 'API Ninjas'",
+        "entry_date": (
+            "TEXT NOT NULL DEFAULT "
+            "(to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS'))"
+        ),
+        "created_at": (
+            "TEXT NOT NULL DEFAULT "
+            "(to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS'))"
+        ),
+    }
+
+    added = set()
+    for col, definition in required_columns.items():
+        if col not in existing:
+            cur.execute(
+                f"ALTER TABLE exercise_entries "
+                f"ADD COLUMN IF NOT EXISTS {col} {definition}"
+            )
+            added.add(col)
+
+    # Best-effort copy of data from common legacy column names.
+    legacy_name_cols = [
+        "exercise", "name", "activity", "activity_name", "exercise_type"
+    ]
+    if "exercise_name" in added:
+        for legacy in legacy_name_cols:
+            if legacy in existing:
+                cur.execute(
+                    f"UPDATE exercise_entries "
+                    f"SET exercise_name = COALESCE({legacy}::TEXT, '') "
+                    f"WHERE exercise_name = ''"
+                )
+                break
+    if "calories_burned" in added:
+        for legacy in ["calories", "total_calories", "kcal"]:
+            if legacy in existing:
+                cur.execute(
+                    f"UPDATE exercise_entries "
+                    f"SET calories_burned = COALESCE({legacy}::DOUBLE PRECISION, 0)"
+                )
+                break
+    if "duration_minutes" in added:
+        for legacy in ["duration", "minutes"]:
+            if legacy in existing:
+                cur.execute(
+                    f"UPDATE exercise_entries "
+                    f"SET duration_minutes = COALESCE({legacy}::DOUBLE PRECISION, 0)"
+                )
+                break
+
+    # Legacy columns the app no longer writes must not block inserts.
+    known = set(required_columns) | {"id", "user_id"}
+    for col, info in existing.items():
+        if col not in known and info["is_nullable"] == "NO":
+            cur.execute(
+                f'ALTER TABLE exercise_entries '
+                f'ALTER COLUMN "{col}" DROP NOT NULL'
+            )
+
+    # The app stores entry_date as ISO text (YYYY-MM-DDTHH:MM:SS).
+    if "entry_date" in existing and existing["entry_date"]["data_type"] in (
+        "date", "timestamp without time zone", "timestamp with time zone"
+    ):
+        cur.execute(
+            "ALTER TABLE exercise_entries ALTER COLUMN entry_date DROP DEFAULT"
+        )
+        cur.execute("""
+            ALTER TABLE exercise_entries
+            ALTER COLUMN entry_date TYPE TEXT
+            USING to_char(entry_date, 'YYYY-MM-DD"T"HH24:MI:SS')
+        """)
+
+
 def init_db():
     """Create compatible food/user tables plus the new exercise table."""
     with get_connection() as conn:
@@ -127,6 +226,9 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            # FIX: upgrade an older, differently-structured exercise_entries
+            # table so that all columns used by this app exist.
+            migrate_exercise_table(cur)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_exercise_user_date
                 ON exercise_entries(user_id, entry_date)
