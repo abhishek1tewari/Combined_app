@@ -16,6 +16,8 @@ from datetime import datetime, date, timedelta
 # Includes date-to-date copying of food and exercise entries,
 # protein / fat / carbohydrate tracking for food, and import of
 # macros from older food_entries columns.
+# Sections are shown as selectable tabs.
+# Manual food can be entered per 100 g OR as actual calories.
 # Run: streamlit run master.py
 # ============================================================
 
@@ -28,6 +30,9 @@ st.set_page_config(
 USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 NINJAS_EXERCISES_URL = "https://api.api-ninjas.com/v1/exercises"
 NINJAS_CALORIES_URL = "https://api.api-ninjas.com/v1/caloriesburned"
+
+# Quantity type label used for manually entered "actual calories" entries.
+ACTUAL_CAL_TYPE = "Actual calories"
 
 # Set to True if your OLD macro columns hold values per 100 g.
 # Leave False if they hold the total grams for the logged quantity.
@@ -547,6 +552,36 @@ def add_food(user_id, food_name, calories_per_100g, quantity_g,
             ))
 
 
+def add_food_actual(user_id, food_name, actual_calories,
+                    protein_g=0.0, fat_g=0.0, carbs_g=0.0):
+    """Add a manual food entry using ACTUAL (total) calories and optional
+    actual macro grams. No quantity is needed.
+
+    Stored in the same food_entries table: the entry is saved as a nominal
+    100 g portion, so calories_per_100g == calories == the actual calories
+    (and likewise for macros). All existing summaries, history, copy and
+    backfill logic therefore work unchanged."""
+    actual_calories = float(actual_calories)
+    protein_g = float(protein_g or 0)
+    fat_g = float(fat_g or 0)
+    carbs_g = float(carbs_g or 0)
+    if actual_calories < 0:
+        raise ValueError("Calories cannot be negative.")
+    add_food(
+        user_id=user_id,
+        food_name=food_name,
+        calories_per_100g=actual_calories,
+        quantity_g=100.0,
+        quantity_type=ACTUAL_CAL_TYPE,
+        unit_count=0,
+        unit_weight=0,
+        source="Manual",
+        protein_per_100g=protein_g,
+        fat_per_100g=fat_g,
+        carbs_per_100g=carbs_g,
+    )
+
+
 def get_food_entries(user_id, selected_day=None):
     selected_day = selected_day or date.today()
     start = datetime.combine(
@@ -617,6 +652,35 @@ def update_food(user_id, food_id, quantity_g, quantity_type,
                 food_id, user_id
             ))
     return True
+
+
+def update_food_actual(user_id, food_id, actual_calories,
+                       protein_g, fat_g, carbs_g):
+    """Edit an 'Actual calories' entry: the values are totals, not per 100 g."""
+    actual_calories = float(actual_calories)
+    protein_g = float(protein_g or 0)
+    fat_g = float(fat_g or 0)
+    carbs_g = float(carbs_g or 0)
+    if actual_calories < 0 or protein_g < 0 or fat_g < 0 or carbs_g < 0:
+        raise ValueError("Calories and macros cannot be negative.")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE food_entries
+                SET quantity_g=100, quantity_type=%s,
+                    unit_count=0, unit_weight=0,
+                    calories_per_100g=%s, calories=%s,
+                    protein_per_100g=%s, fat_per_100g=%s, carbs_per_100g=%s,
+                    protein_g=%s, fat_g=%s, carbs_g=%s
+                WHERE id=%s AND user_id=%s
+            """, (
+                ACTUAL_CAL_TYPE,
+                actual_calories, actual_calories,
+                protein_g, fat_g, carbs_g,
+                protein_g, fat_g, carbs_g,
+                food_id, user_id
+            ))
+            return cur.rowcount > 0
 
 
 def delete_food(user_id, food_id):
@@ -1467,995 +1531,1137 @@ st.divider()
 
 
 # ============================================================
-# FOOD INPUT SECTION
+# MAIN SECTIONS AS SELECTABLE TABS
 # ============================================================
-st.header("🍎 Food Diary")
-st.subheader("➕ Add Food")
+tab_food, tab_exercise, tab_weight, tab_copy, tab_history = st.tabs([
+    "🍎 Food Diary",
+    "🏋️ Exercise Diary",
+    "⚖️ Weight Log",
+    "📋 Copy Entries",
+    "📅 History",
+])
 
-food_method = st.radio(
-    "Choose how to add food",
-    ["Search USDA Food Database", "Enter Food Manually"],
-    horizontal=True,
-    key="food_entry_method"
-)
 
-if food_method == "Search USDA Food Database":
-    food_query = st.text_input(
-        "Search food",
-        placeholder="Example: apple, egg, banana, cooked rice",
-        key="usda_query"
+# ============================================================
+# TAB 1: FOOD (add + diary)
+# ============================================================
+with tab_food:
+    st.header("🍎 Food Diary")
+    st.subheader("➕ Add Food")
+
+    food_method = st.radio(
+        "Choose how to add food",
+        ["Search USDA Food Database", "Enter Food Manually"],
+        horizontal=True,
+        key="food_entry_method"
     )
 
-    if len(food_query.strip()) >= 2:
-        if not usda_api_key:
-            st.info("Enter your USDA API key in the sidebar to search.")
-        else:
-            with st.spinner("Searching USDA FoodData Central..."):
-                try:
-                    foods, api_error = search_food_api(
-                        food_query.strip(), usda_api_key
-                    )
-                except Exception as exc:
-                    foods, api_error = [], str(exc)
+    if food_method == "Search USDA Food Database":
+        food_query = st.text_input(
+            "Search food",
+            placeholder="Example: apple, egg, banana, cooked rice",
+            key="usda_query"
+        )
 
-            if api_error:
-                st.error(api_error)
-            elif foods:
-                labels = [
-                    f"{f['name']} | {f['brand'] or 'Generic'} | "
-                    f"{f['calories']:.1f} kcal / 100 g | "
-                    f"P {f['protein']:.1f} · F {f['fat']:.1f} · C {f['carbs']:.1f} g"
-                    for f in foods
-                ]
-                selected_index = st.selectbox(
-                    "Select a food",
-                    range(len(foods)),
-                    format_func=lambda i: labels[i],
-                    key="usda_selected_index"
+        if len(food_query.strip()) >= 2:
+            if not usda_api_key:
+                st.info("Enter your USDA API key in the sidebar to search.")
+            else:
+                with st.spinner("Searching USDA FoodData Central..."):
+                    try:
+                        foods, api_error = search_food_api(
+                            food_query.strip(), usda_api_key
+                        )
+                    except Exception as exc:
+                        foods, api_error = [], str(exc)
+
+                if api_error:
+                    st.error(api_error)
+                elif foods:
+                    labels = [
+                        f"{f['name']} | {f['brand'] or 'Generic'} | "
+                        f"{f['calories']:.1f} kcal / 100 g | "
+                        f"P {f['protein']:.1f} · F {f['fat']:.1f} · C {f['carbs']:.1f} g"
+                        for f in foods
+                    ]
+                    selected_index = st.selectbox(
+                        "Select a food",
+                        range(len(foods)),
+                        format_func=lambda i: labels[i],
+                        key="usda_selected_index"
+                    )
+
+                    if st.button(
+                        "Use selected USDA food", key="use_usda_food"
+                    ):
+                        st.session_state.selected_food = {
+                            **foods[selected_index],
+                            "source": "USDA"
+                        }
+                        st.rerun()
+                else:
+                    st.warning(
+                        "No matching foods with calorie information were found."
+                    )
+
+    else:
+        st.write(
+            "Add homemade food or any item not found in the USDA database."
+        )
+
+        manual_cal_mode = st.radio(
+            "How do you want to enter the calories?",
+            ["Per 100 g", "Actual calories (no quantity needed)"],
+            horizontal=True,
+            key="manual_cal_mode"
+        )
+
+        if manual_cal_mode == "Per 100 g":
+            with st.form("manual_food_form", clear_on_submit=False):
+                manual_name = st.text_input(
+                    "Food name",
+                    placeholder="Example: Homemade paneer curry"
+                )
+                manual_calories = st.number_input(
+                    "Calories per 100 grams (kcal)",
+                    min_value=0.0,
+                    max_value=10000.0,
+                    value=150.0,
+                    step=1.0
+                )
+                mp_col, mf_col, mc_col = st.columns(3)
+                with mp_col:
+                    manual_protein = st.number_input(
+                        "Protein per 100 g (g)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                with mf_col:
+                    manual_fat = st.number_input(
+                        "Fat per 100 g (g)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                with mc_col:
+                    manual_carbs = st.number_input(
+                        "Carbs per 100 g (g)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                manual_submit = st.form_submit_button(
+                    "Continue to quantity"
                 )
 
-                if st.button(
-                    "Use selected USDA food", key="use_usda_food"
-                ):
+            if manual_submit:
+                if not manual_name.strip():
+                    st.error("Please enter a food name.")
+                else:
                     st.session_state.selected_food = {
-                        **foods[selected_index],
-                        "source": "USDA"
+                        "name": manual_name.strip(),
+                        "calories": float(manual_calories),
+                        "protein": float(manual_protein),
+                        "fat": float(manual_fat),
+                        "carbs": float(manual_carbs),
+                        "brand": "Manual entry",
+                        "serving_weight": None,
+                        "serving_size": "User entered",
+                        "source": "Manual"
                     }
                     st.rerun()
-            else:
-                st.warning(
-                    "No matching foods with calorie information were found."
-                )
 
-else:
-    st.write(
-        "Add homemade food or any item not found in the USDA database."
-    )
-    with st.form("manual_food_form", clear_on_submit=False):
-        manual_name = st.text_input(
-            "Food name",
-            placeholder="Example: Homemade paneer curry"
-        )
-        manual_calories = st.number_input(
-            "Calories per 100 grams (kcal)",
-            min_value=0.0,
-            max_value=10000.0,
-            value=150.0,
-            step=1.0
-        )
-        mp_col, mf_col, mc_col = st.columns(3)
-        with mp_col:
-            manual_protein = st.number_input(
-                "Protein per 100 g (g)",
-                min_value=0.0,
-                max_value=100.0,
-                value=0.0,
-                step=0.5
-            )
-        with mf_col:
-            manual_fat = st.number_input(
-                "Fat per 100 g (g)",
-                min_value=0.0,
-                max_value=100.0,
-                value=0.0,
-                step=0.5
-            )
-        with mc_col:
-            manual_carbs = st.number_input(
-                "Carbs per 100 g (g)",
-                min_value=0.0,
-                max_value=100.0,
-                value=0.0,
-                step=0.5
-            )
-        manual_submit = st.form_submit_button(
-            "Continue to quantity"
-        )
-
-    if manual_submit:
-        if not manual_name.strip():
-            st.error("Please enter a food name.")
         else:
-            st.session_state.selected_food = {
-                "name": manual_name.strip(),
-                "calories": float(manual_calories),
-                "protein": float(manual_protein),
-                "fat": float(manual_fat),
-                "carbs": float(manual_carbs),
-                "brand": "Manual entry",
-                "serving_weight": None,
-                "serving_size": "User entered",
-                "source": "Manual"
-            }
-            st.rerun()
-
-
-selected_food = st.session_state.selected_food
-
-if selected_food is not None:
-    st.divider()
-    st.markdown(f"**Selected food:** {selected_food['name']}")
-    st.caption(
-        f"{selected_food['calories']:.1f} kcal per 100 g · "
-        f"Protein {selected_food.get('protein', 0.0):.1f} g · "
-        f"Fat {selected_food.get('fat', 0.0):.1f} g · "
-        f"Carbs {selected_food.get('carbs', 0.0):.1f} g per 100 g · "
-        f"{selected_food.get('source', 'Manual')}"
-    )
-
-    quantity_type = st.radio(
-        "Quantity unit",
-        ["Grams (g)", "Units (pieces)"],
-        horizontal=True,
-        key="add_quantity_type"
-    )
-
-    if quantity_type == "Grams (g)":
-        quantity_g = st.number_input(
-            "Quantity in grams",
-            min_value=1.0,
-            max_value=10000.0,
-            value=100.0,
-            step=10.0,
-            key="add_quantity_grams"
-        )
-        unit_count = 0.0
-        unit_weight = 0.0
-    else:
-        unit_count = st.number_input(
-            "Number of pieces",
-            min_value=1.0,
-            max_value=1000.0,
-            value=1.0,
-            step=1.0,
-            key="add_unit_count"
-        )
-        default_weight = selected_food.get("serving_weight") or 100
-        unit_weight = st.number_input(
-            "Weight of one piece (grams)",
-            min_value=1.0,
-            max_value=5000.0,
-            value=float(default_weight),
-            step=1.0,
-            key="add_unit_weight"
-        )
-        quantity_g = unit_count * unit_weight
-
-    calculated_food_calories = (
-        selected_food["calories"] * quantity_g / 100
-    )
-    calculated_protein = selected_food.get("protein", 0.0) * quantity_g / 100
-    calculated_fat = selected_food.get("fat", 0.0) * quantity_g / 100
-    calculated_carbs = selected_food.get("carbs", 0.0) * quantity_g / 100
-
-    fa, fb = st.columns(2)
-    fa.metric("Total quantity", f"{quantity_g:.1f} g")
-    fb.metric(
-        "Calories for this quantity",
-        f"{calculated_food_calories:.1f} kcal"
-    )
-    fc, fd, fe = st.columns(3)
-    fc.metric("Protein", f"{calculated_protein:.1f} g")
-    fd.metric("Fat", f"{calculated_fat:.1f} g")
-    fe.metric("Carbs", f"{calculated_carbs:.1f} g")
-
-    food_add_col, food_clear_col = st.columns(2)
-
-    with food_add_col:
-        if st.button(
-            "➕ Add food to diary",
-            type="primary",
-            use_container_width=True
-        ):
-            try:
-                add_food(
-                    user_id=user_id,
-                    food_name=selected_food["name"],
-                    calories_per_100g=selected_food["calories"],
-                    quantity_g=quantity_g,
-                    quantity_type=quantity_type,
-                    unit_count=unit_count,
-                    unit_weight=unit_weight,
-                    source=selected_food.get("source", "Manual"),
-                    protein_per_100g=selected_food.get("protein", 0.0),
-                    fat_per_100g=selected_food.get("fat", 0.0),
-                    carbs_per_100g=selected_food.get("carbs", 0.0)
-                )
-                st.session_state.selected_food = None
-                st.success("Food added to your diary.")
-                st.rerun()
-            except (ValueError, psycopg2.Error) as exc:
-                st.error(f"Could not add food: {exc}")
-
-    with food_clear_col:
-        if st.button(
-            "Clear selected food", use_container_width=True
-        ):
-            st.session_state.selected_food = None
-            st.rerun()
-
-
-# ============================================================
-# EXERCISE INPUT SECTION
-# ============================================================
-st.divider()
-st.header("🏋️ Exercise Diary")
-st.subheader("➕ Add Exercise")
-
-exercise_mode = st.radio(
-    "How would you like to add exercise?",
-    [
-        "Search API Ninjas",
-        "Enter Exercise Manually"
-    ],
-    horizontal=True,
-    key="exercise_mode"
-)
-
-if exercise_mode == "Search API Ninjas":
-    if not ninjas_api_key:
-        st.info(
-            "Enter your API Ninjas key in the sidebar to search "
-            "exercise names and estimate calories burned."
-        )
-    else:
-        exercise_category = st.radio(
-            "Exercise category",
-            ["Strength Training", "Cardio"],
-            horizontal=True,
-            key="exercise_category"
-        )
-
-        search_term = st.text_input(
-            "Search exercise",
-            placeholder=(
-                "Examples: bench press, squat, bicep curl, "
-                "running, cycling, treadmill"
-            ),
-            key="exercise_search_term"
-        )
-
-        if len(search_term.strip()) >= 2:
-            api_type = (
-                "strength"
-                if exercise_category == "Strength Training"
-                else "cardio"
+            st.caption(
+                "Enter the actual total calories for what you ate. "
+                "No quantity is needed — the entry is added directly to "
+                "your diary. Protein, fat and carbs are optional totals in grams."
             )
+            with st.form("manual_actual_food_form", clear_on_submit=True):
+                actual_name = st.text_input(
+                    "Food name",
+                    placeholder="Example: Restaurant paneer wrap"
+                )
+                actual_calories = st.number_input(
+                    "Actual calories (kcal)",
+                    min_value=0.0,
+                    max_value=100000.0,
+                    value=150.0,
+                    step=1.0
+                )
+                ap_col, af_col, ac_col = st.columns(3)
+                with ap_col:
+                    actual_protein = st.number_input(
+                        "Protein (g, total)",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                with af_col:
+                    actual_fat = st.number_input(
+                        "Fat (g, total)",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                with ac_col:
+                    actual_carbs = st.number_input(
+                        "Carbs (g, total)",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=0.0,
+                        step=0.5
+                    )
+                actual_submit = st.form_submit_button(
+                    "➕ Add food to diary", type="primary"
+                )
 
-            with st.spinner("Searching API Ninjas exercise database..."):
+            if actual_submit:
+                if not actual_name.strip():
+                    st.error("Please enter a food name.")
+                else:
+                    try:
+                        add_food_actual(
+                            user_id, actual_name, actual_calories,
+                            actual_protein, actual_fat, actual_carbs
+                        )
+                        st.session_state.selected_food = None
+                        st.rerun()
+                    except (ValueError, psycopg2.Error) as exc:
+                        st.error(f"Could not add food: {exc}")
+
+    selected_food = st.session_state.selected_food
+
+    if selected_food is not None:
+        st.divider()
+        st.markdown(f"**Selected food:** {selected_food['name']}")
+        st.caption(
+            f"{selected_food['calories']:.1f} kcal per 100 g · "
+            f"Protein {selected_food.get('protein', 0.0):.1f} g · "
+            f"Fat {selected_food.get('fat', 0.0):.1f} g · "
+            f"Carbs {selected_food.get('carbs', 0.0):.1f} g per 100 g · "
+            f"{selected_food.get('source', 'Manual')}"
+        )
+
+        quantity_type = st.radio(
+            "Quantity unit",
+            ["Grams (g)", "Units (pieces)"],
+            horizontal=True,
+            key="add_quantity_type"
+        )
+
+        if quantity_type == "Grams (g)":
+            quantity_g = st.number_input(
+                "Quantity in grams",
+                min_value=1.0,
+                max_value=10000.0,
+                value=100.0,
+                step=10.0,
+                key="add_quantity_grams"
+            )
+            unit_count = 0.0
+            unit_weight = 0.0
+        else:
+            unit_count = st.number_input(
+                "Number of pieces",
+                min_value=1.0,
+                max_value=1000.0,
+                value=1.0,
+                step=1.0,
+                key="add_unit_count"
+            )
+            default_weight = selected_food.get("serving_weight") or 100
+            unit_weight = st.number_input(
+                "Weight of one piece (grams)",
+                min_value=1.0,
+                max_value=5000.0,
+                value=float(default_weight),
+                step=1.0,
+                key="add_unit_weight"
+            )
+            quantity_g = unit_count * unit_weight
+
+        calculated_food_calories = (
+            selected_food["calories"] * quantity_g / 100
+        )
+        calculated_protein = selected_food.get("protein", 0.0) * quantity_g / 100
+        calculated_fat = selected_food.get("fat", 0.0) * quantity_g / 100
+        calculated_carbs = selected_food.get("carbs", 0.0) * quantity_g / 100
+
+        fa, fb = st.columns(2)
+        fa.metric("Total quantity", f"{quantity_g:.1f} g")
+        fb.metric(
+            "Calories for this quantity",
+            f"{calculated_food_calories:.1f} kcal"
+        )
+        fc, fd, fe = st.columns(3)
+        fc.metric("Protein", f"{calculated_protein:.1f} g")
+        fd.metric("Fat", f"{calculated_fat:.1f} g")
+        fe.metric("Carbs", f"{calculated_carbs:.1f} g")
+
+        food_add_col, food_clear_col = st.columns(2)
+
+        with food_add_col:
+            if st.button(
+                "➕ Add food to diary",
+                type="primary",
+                use_container_width=True
+            ):
                 try:
-                    exercise_results = search_ninjas_exercises(
-                        search_term.strip(),
-                        api_type,
-                        ninjas_api_key
+                    add_food(
+                        user_id=user_id,
+                        food_name=selected_food["name"],
+                        calories_per_100g=selected_food["calories"],
+                        quantity_g=quantity_g,
+                        quantity_type=quantity_type,
+                        unit_count=unit_count,
+                        unit_weight=unit_weight,
+                        source=selected_food.get("source", "Manual"),
+                        protein_per_100g=selected_food.get("protein", 0.0),
+                        fat_per_100g=selected_food.get("fat", 0.0),
+                        carbs_per_100g=selected_food.get("carbs", 0.0)
                     )
-                    exercise_search_error = None
-                except requests.exceptions.HTTPError as exc:
-                    status = (
-                        exc.response.status_code
-                        if exc.response is not None else None
-                    )
-                    exercise_results = []
-                    if status in (401, 403):
-                        exercise_search_error = (
-                            "API Ninjas key is invalid or this endpoint "
-                            "is not enabled for your plan."
+                    st.session_state.selected_food = None
+                    st.success("Food added to your diary.")
+                    st.rerun()
+                except (ValueError, psycopg2.Error) as exc:
+                    st.error(f"Could not add food: {exc}")
+
+        with food_clear_col:
+            if st.button(
+                "Clear selected food", use_container_width=True
+            ):
+                st.session_state.selected_food = None
+                st.rerun()
+
+    # --------------------------------------------------------
+    # FOOD DIARY - VIEW / EDIT / DELETE
+    # --------------------------------------------------------
+    st.divider()
+    st.subheader("📋 Food Diary")
+
+    food_diary_day = st.date_input(
+        "Food diary date",
+        value=date.today(),
+        key="food_diary_day"
+    )
+    food_entries = get_food_entries(user_id, food_diary_day)
+
+    if food_entries:
+        st.metric(
+            f"Food calories on {food_diary_day.strftime('%d %b %Y')}",
+            f"{sum(float(e['calories']) for e in food_entries):.1f} kcal"
+        )
+        dm1, dm2, dm3 = st.columns(3)
+        dm1.metric(
+            "Protein",
+            f"{sum(float(e.get('protein_g') or 0) for e in food_entries):.1f} g"
+        )
+        dm2.metric(
+            "Fat",
+            f"{sum(float(e.get('fat_g') or 0) for e in food_entries):.1f} g"
+        )
+        dm3.metric(
+            "Carbs",
+            f"{sum(float(e.get('carbs_g') or 0) for e in food_entries):.1f} g"
+        )
+
+        for entry in food_entries:
+            is_actual = entry["quantity_type"] == ACTUAL_CAL_TYPE
+            if is_actual:
+                title = (
+                    f"{entry['food_name']} — actual calories — "
+                    f"{entry['calories']:.1f} kcal"
+                )
+            else:
+                title = (
+                    f"{entry['food_name']} — {entry['quantity_g']:.0f} g — "
+                    f"{entry['calories']:.1f} kcal"
+                )
+
+            with st.expander(title):
+                st.caption(
+                    f"Source: {entry['source']} · Added: "
+                    f"{entry['created_at'][:16].replace('T', ' ')}"
+                )
+                st.write(
+                    f"**Protein:** {float(entry.get('protein_g') or 0):.1f} g · "
+                    f"**Fat:** {float(entry.get('fat_g') or 0):.1f} g · "
+                    f"**Carbs:** {float(entry.get('carbs_g') or 0):.1f} g"
+                )
+
+                if is_actual:
+                    # Entry holds actual totals, not per-100 g values.
+                    with st.form(f"edit_food_actual_form_{entry['id']}"):
+                        edit_actual_cal = st.number_input(
+                            "Actual calories (kcal)",
+                            min_value=0.0,
+                            max_value=100000.0,
+                            value=float(entry["calories"]),
+                            step=1.0,
+                            key=f"edit_actual_cal_{entry['id']}"
                         )
-                    else:
-                        exercise_search_error = f"API error: {exc}"
-                except Exception as exc:
-                    exercise_results = []
-                    exercise_search_error = str(exc)
-
-            if exercise_search_error:
-                st.error(exercise_search_error)
-            elif exercise_results:
-                exercise_labels = [
-                    (
-                        f"{item.get('name', 'Unknown')} | "
-                        f"{item.get('muscle', 'N/A')} | "
-                        f"{item.get('difficulty', 'N/A')}"
-                    )
-                    for item in exercise_results
-                ]
-
-                chosen_exercise_index = st.selectbox(
-                    "Select matching exercise",
-                    range(len(exercise_results)),
-                    format_func=lambda i: exercise_labels[i],
-                    key="chosen_api_exercise"
-                )
-                chosen_exercise = exercise_results[
-                    chosen_exercise_index
-                ]
-                chosen_exercise_name = chosen_exercise.get(
-                    "name", search_term.strip()
-                )
-
-                with st.expander("Exercise instructions and details"):
-                    st.write(
-                        f"**Target muscle:** "
-                        f"{chosen_exercise.get('muscle', 'Not specified')}"
-                    )
-                    st.write(
-                        f"**Difficulty:** "
-                        f"{chosen_exercise.get('difficulty', 'Not specified')}"
-                    )
-                    equipment = chosen_exercise.get("equipments", [])
-                    if equipment:
-                        st.write(
-                            "**Equipment:** " + ", ".join(equipment)
+                        ea1, ea2, ea3 = st.columns(3)
+                        with ea1:
+                            edit_actual_p = st.number_input(
+                                "Protein (g, total)",
+                                min_value=0.0,
+                                max_value=10000.0,
+                                value=float(entry.get("protein_g") or 0),
+                                step=0.5,
+                                key=f"edit_actual_p_{entry['id']}"
+                            )
+                        with ea2:
+                            edit_actual_f = st.number_input(
+                                "Fat (g, total)",
+                                min_value=0.0,
+                                max_value=10000.0,
+                                value=float(entry.get("fat_g") or 0),
+                                step=0.5,
+                                key=f"edit_actual_f_{entry['id']}"
+                            )
+                        with ea3:
+                            edit_actual_c = st.number_input(
+                                "Carbs (g, total)",
+                                min_value=0.0,
+                                max_value=10000.0,
+                                value=float(entry.get("carbs_g") or 0),
+                                step=0.5,
+                                key=f"edit_actual_c_{entry['id']}"
+                            )
+                        save_actual_edit = st.form_submit_button(
+                            "Save changes"
                         )
-                    if chosen_exercise.get("instructions"):
-                        st.write(chosen_exercise["instructions"])
-                    if chosen_exercise.get("safety_info"):
-                        st.info(chosen_exercise["safety_info"])
 
-                st.markdown(f"**Selected exercise:** {chosen_exercise_name}")
+                    if save_actual_edit:
+                        try:
+                            update_food_actual(
+                                user_id, entry["id"], edit_actual_cal,
+                                edit_actual_p, edit_actual_f, edit_actual_c
+                            )
+                            st.success("Food entry updated.")
+                            st.rerun()
+                        except (ValueError, psycopg2.Error) as exc:
+                            st.error(f"Could not update entry: {exc}")
 
-                body_weight_kg = st.number_input(
-                    "Your body weight (kg) — used for calorie estimate",
-                    min_value=20.0,
-                    max_value=300.0,
-                    value=78.0,
-                    step=0.5,
-                    key="api_body_weight"
-                )
+                else:
+                    with st.form(f"edit_food_form_{entry['id']}"):
+                        edit_quantity = st.number_input(
+                            "Edit quantity (grams)",
+                            min_value=0.1,
+                            max_value=10000.0,
+                            value=float(entry["quantity_g"]),
+                            step=1.0,
+                            key=f"edit_food_qty_{entry['id']}"
+                        )
 
-                if exercise_category == "Strength Training":
-                    st.caption(
-                        "Record the resistance/load, sets and reps below. "
-                        "API Ninjas estimates calorie burn using body weight "
-                        "and workout duration; lifted load and reps are "
-                        "saved in your diary but are not inputs to its "
-                        "calorie formula."
-                    )
-                    s1, s2, s3 = st.columns(3)
-                    with s1:
-                        lifted_weight_kg = st.number_input(
-                            "Weight lifted (kg)",
+                        edit_type = st.selectbox(
+                            "Quantity type",
+                            ["Grams (g)", "Units (pieces)"],
+                            index=(
+                                0 if entry["quantity_type"] == "Grams (g)"
+                                else 1
+                            ),
+                            key=f"edit_food_type_{entry['id']}"
+                        )
+
+                        edit_count = st.number_input(
+                            "Number of pieces (if applicable)",
                             min_value=0.0,
                             max_value=1000.0,
-                            value=20.0,
+                            value=float(entry["unit_count"]),
                             step=1.0,
-                            key="api_lifted_weight"
-                        )
-                    with s2:
-                        sets_count = st.number_input(
-                            "Sets",
-                            min_value=1,
-                            max_value=100,
-                            value=3,
-                            step=1,
-                            key="api_strength_sets"
-                        )
-                    with s3:
-                        reps_count = st.number_input(
-                            "Reps per set",
-                            min_value=1,
-                            max_value=500,
-                            value=12,
-                            step=1,
-                            key="api_strength_reps"
+                            key=f"edit_food_count_{entry['id']}"
                         )
 
-                    duration_minutes = st.number_input(
-                        "Total workout duration (minutes, including rests)",
-                        min_value=1,
-                        max_value=600,
-                        value=45,
-                        step=5,
-                        key="api_strength_duration"
-                    )
-                else:
-                    lifted_weight_kg = 0.0
-                    sets_count = 0
-                    reps_count = 0
-                    duration_minutes = st.number_input(
-                        "Cardio duration (minutes)",
-                        min_value=1,
-                        max_value=600,
-                        value=30,
-                        step=5,
-                        key="api_cardio_duration"
-                    )
+                        edit_weight = st.number_input(
+                            "Weight per piece in grams (if applicable)",
+                            min_value=0.0,
+                            max_value=5000.0,
+                            value=float(entry["unit_weight"]),
+                            step=1.0,
+                            key=f"edit_food_weight_{entry['id']}"
+                        )
 
-                if st.button(
-                    "Calculate calories burned",
-                    type="primary",
-                    key="calculate_api_exercise"
-                ):
-                    try:
-                        with st.spinner(
-                            "Calculating estimated calories burned..."
-                        ):
-                            estimate = estimate_ninjas_calories(
-                                chosen_exercise_name,
-                                body_weight_kg,
-                                duration_minutes,
-                                ninjas_api_key
+                        st.caption(
+                            "Macros per 100 g (use this to fill in protein, fat and "
+                            "carbs for entries logged before macros were tracked)."
+                        )
+                        em1, em2, em3 = st.columns(3)
+                        with em1:
+                            edit_protein100 = st.number_input(
+                                "Protein / 100 g",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(entry.get("protein_per_100g") or 0),
+                                step=0.5,
+                                key=f"edit_food_protein_{entry['id']}"
+                            )
+                        with em2:
+                            edit_fat100 = st.number_input(
+                                "Fat / 100 g",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(entry.get("fat_per_100g") or 0),
+                                step=0.5,
+                                key=f"edit_food_fat_{entry['id']}"
+                            )
+                        with em3:
+                            edit_carbs100 = st.number_input(
+                                "Carbs / 100 g",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(entry.get("carbs_per_100g") or 0),
+                                step=0.5,
+                                key=f"edit_food_carbs_{entry['id']}"
                             )
 
-                        st.session_state["pending_exercise"] = {
-                            "exercise_name": estimate["matched_name"],
-                            "category": exercise_category,
-                            "duration_minutes": duration_minutes,
-                            "body_weight_kg": body_weight_kg,
-                            "lifted_weight_kg": lifted_weight_kg,
-                            "sets": sets_count,
-                            "reps": reps_count,
-                            "calories_burned": estimate["calories"],
-                            "source": "API Ninjas"
-                        }
+                        save_food_edit = st.form_submit_button(
+                            "Save quantity changes"
+                        )
+
+                    if save_food_edit:
+                        if edit_type == "Units (pieces)":
+                            if edit_count <= 0 or edit_weight <= 0:
+                                st.error(
+                                    "Enter a positive piece count and piece weight."
+                                )
+                            else:
+                                final_qty = edit_count * edit_weight
+                                update_food(
+                                    user_id, entry["id"], final_qty,
+                                    edit_type, edit_count, edit_weight,
+                                    edit_protein100, edit_fat100, edit_carbs100
+                                )
+                                st.success("Food quantity updated.")
+                                st.rerun()
+                        else:
+                            update_food(
+                                user_id, entry["id"], edit_quantity,
+                                edit_type, 0, 0,
+                                edit_protein100, edit_fat100, edit_carbs100
+                            )
+                            st.success("Food quantity updated.")
+                            st.rerun()
+
+                copy_food_date = st.date_input(
+                    "Copy this food entry to date",
+                    value=food_diary_day + timedelta(days=1),
+                    key=f"copy_food_date_{entry['id']}"
+                )
+                if st.button(
+                    "📄 Copy this food entry",
+                    key=f"copy_food_{entry['id']}"
+                ):
+                    if copy_food_date == food_diary_day:
+                        st.error("Choose a different destination date.")
+                    elif copy_food_entry(user_id, entry["id"], copy_food_date):
+                        st.success(f"Food entry copied to {copy_food_date.strftime('%d %b %Y')}.")
+                        st.rerun()
+                    else:
+                        st.error("Could not find this food entry to copy.")
+
+                if st.button(
+                    "🗑️ Delete food entry",
+                    key=f"delete_food_{entry['id']}"
+                ):
+                    delete_food(user_id, entry["id"])
+                    st.success("Food entry deleted.")
+                    st.rerun()
+    else:
+        st.info("No food entries for this date.")
+
+
+# ============================================================
+# TAB 2: EXERCISE (add + diary)
+# ============================================================
+with tab_exercise:
+    st.header("🏋️ Exercise Diary")
+    st.subheader("➕ Add Exercise")
+
+    exercise_mode = st.radio(
+        "How would you like to add exercise?",
+        [
+            "Search API Ninjas",
+            "Enter Exercise Manually"
+        ],
+        horizontal=True,
+        key="exercise_mode"
+    )
+
+    if exercise_mode == "Search API Ninjas":
+        if not ninjas_api_key:
+            st.info(
+                "Enter your API Ninjas key in the sidebar to search "
+                "exercise names and estimate calories burned."
+            )
+        else:
+            exercise_category = st.radio(
+                "Exercise category",
+                ["Strength Training", "Cardio"],
+                horizontal=True,
+                key="exercise_category"
+            )
+
+            search_term = st.text_input(
+                "Search exercise",
+                placeholder=(
+                    "Examples: bench press, squat, bicep curl, "
+                    "running, cycling, treadmill"
+                ),
+                key="exercise_search_term"
+            )
+
+            if len(search_term.strip()) >= 2:
+                api_type = (
+                    "strength"
+                    if exercise_category == "Strength Training"
+                    else "cardio"
+                )
+
+                with st.spinner("Searching API Ninjas exercise database..."):
+                    try:
+                        exercise_results = search_ninjas_exercises(
+                            search_term.strip(),
+                            api_type,
+                            ninjas_api_key
+                        )
+                        exercise_search_error = None
                     except requests.exceptions.HTTPError as exc:
                         status = (
                             exc.response.status_code
                             if exc.response is not None else None
                         )
+                        exercise_results = []
                         if status in (401, 403):
-                            st.error(
-                                "API Ninjas rejected the key or access "
-                                "to this endpoint."
-                            )
-                        elif status == 429:
-                            st.error(
-                                "API Ninjas rate limit/quota reached. "
-                                "Try later or enter the exercise manually."
+                            exercise_search_error = (
+                                "API Ninjas key is invalid or this endpoint "
+                                "is not enabled for your plan."
                             )
                         else:
-                            st.error(f"API request failed: {exc}")
+                            exercise_search_error = f"API error: {exc}"
                     except Exception as exc:
-                        st.error(f"Could not calculate calories: {exc}")
+                        exercise_results = []
+                        exercise_search_error = str(exc)
 
-                pending = st.session_state.get("pending_exercise")
-                if pending:
-                    st.divider()
-                    st.metric(
-                        "Estimated calories burned",
-                        f"{pending['calories_burned']:.0f} kcal"
+                if exercise_search_error:
+                    st.error(exercise_search_error)
+                elif exercise_results:
+                    exercise_labels = [
+                        (
+                            f"{item.get('name', 'Unknown')} | "
+                            f"{item.get('muscle', 'N/A')} | "
+                            f"{item.get('difficulty', 'N/A')}"
+                        )
+                        for item in exercise_results
+                    ]
+
+                    chosen_exercise_index = st.selectbox(
+                        "Select matching exercise",
+                        range(len(exercise_results)),
+                        format_func=lambda i: exercise_labels[i],
+                        key="chosen_api_exercise"
                     )
-                    st.caption(
-                        f"API activity match: {pending['exercise_name']} · "
-                        f"{pending['duration_minutes']} minutes"
+                    chosen_exercise = exercise_results[
+                        chosen_exercise_index
+                    ]
+                    chosen_exercise_name = chosen_exercise.get(
+                        "name", search_term.strip()
                     )
-                    save_col, cancel_col = st.columns(2)
 
-                    with save_col:
-                        if st.button(
-                            "Save exercise to diary",
-                            type="primary",
-                            use_container_width=True,
-                            key="save_api_exercise"
-                        ):
-                            try:
-                                add_exercise(
-                                    user_id=user_id,
-                                    exercise_name=pending["exercise_name"],
-                                    category=pending["category"],
-                                    duration_minutes=pending["duration_minutes"],
-                                    body_weight_kg=pending["body_weight_kg"],
-                                    lifted_weight_kg=pending["lifted_weight_kg"],
-                                    sets=pending["sets"],
-                                    reps=pending["reps"],
-                                    calories_burned=pending["calories_burned"],
-                                    source=pending["source"]
-                                )
-                                del st.session_state["pending_exercise"]
-                                st.success("Exercise saved to your diary.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Could not save exercise: {exc}")
+                    with st.expander("Exercise instructions and details"):
+                        st.write(
+                            f"**Target muscle:** "
+                            f"{chosen_exercise.get('muscle', 'Not specified')}"
+                        )
+                        st.write(
+                            f"**Difficulty:** "
+                            f"{chosen_exercise.get('difficulty', 'Not specified')}"
+                        )
+                        equipment = chosen_exercise.get("equipments", [])
+                        if equipment:
+                            st.write(
+                                "**Equipment:** " + ", ".join(equipment)
+                            )
+                        if chosen_exercise.get("instructions"):
+                            st.write(chosen_exercise["instructions"])
+                        if chosen_exercise.get("safety_info"):
+                            st.info(chosen_exercise["safety_info"])
 
-                    with cancel_col:
-                        if st.button(
-                            "Discard estimate",
-                            use_container_width=True,
-                            key="discard_api_exercise"
-                        ):
-                            del st.session_state["pending_exercise"]
-                            st.rerun()
+                    st.markdown(f"**Selected exercise:** {chosen_exercise_name}")
 
-            else:
-                st.warning(
-                    "No matching exercise found. Try a shorter or more "
-                    "general search term, or use manual entry."
-                )
-
-        else:
-            st.caption(
-                "Type at least two characters to search the API Ninjas "
-                "exercise catalogue."
-            )
-
-else:
-    st.write(
-        "Use this option if an exercise is unavailable through the API, "
-        "or if you have a calorie value from a watch or another source."
-    )
-
-    with st.form("manual_exercise_form"):
-        manual_exercise_name = st.text_input(
-            "Exercise name",
-            placeholder="Example: Barbell squat, treadmill walk"
-        )
-        manual_category = st.selectbox(
-            "Category",
-            ["Strength Training", "Cardio", "Sports", "Other"]
-        )
-
-        manual_body_weight = st.number_input(
-            "Your body weight (kg)",
-            min_value=0.0,
-            max_value=300.0,
-            value=78.0,
-            step=0.5
-        )
-
-        manual_duration = st.number_input(
-            "Duration (minutes)",
-            min_value=0.0,
-            max_value=1000.0,
-            value=45.0,
-            step=5.0
-        )
-
-        manual_lift_col1, manual_lift_col2, manual_lift_col3 = st.columns(3)
-        with manual_lift_col1:
-            manual_lifted_weight = st.number_input(
-                "Weight lifted (kg)",
-                min_value=0.0,
-                max_value=1000.0,
-                value=0.0,
-                step=1.0
-            )
-        with manual_lift_col2:
-            manual_sets = st.number_input(
-                "Sets",
-                min_value=0,
-                max_value=100,
-                value=0,
-                step=1
-            )
-        with manual_lift_col3:
-            manual_reps = st.number_input(
-                "Reps per set",
-                min_value=0,
-                max_value=500,
-                value=0,
-                step=1
-            )
-
-        manual_burned = st.number_input(
-            "Calories burned (kcal)",
-            min_value=0.0,
-            max_value=10000.0,
-            value=100.0,
-            step=5.0
-        )
-
-        manual_exercise_submit = st.form_submit_button(
-            "Save manual exercise", type="primary"
-        )
-
-    if manual_exercise_submit:
-        if not manual_exercise_name.strip():
-            st.error("Please enter an exercise name.")
-        elif manual_burned < 0:
-            st.error("Calories burned cannot be negative.")
-        else:
-            try:
-                add_exercise(
-                    user_id=user_id,
-                    exercise_name=manual_exercise_name,
-                    category=manual_category,
-                    duration_minutes=manual_duration,
-                    body_weight_kg=manual_body_weight,
-                    lifted_weight_kg=manual_lifted_weight,
-                    sets=manual_sets,
-                    reps=manual_reps,
-                    calories_burned=manual_burned,
-                    source="Manual"
-                )
-                st.success("Manual exercise saved.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Could not save exercise: {exc}")
-
-
-# ============================================================
-# FOOD DIARY - VIEW / EDIT / DELETE
-# ============================================================
-st.divider()
-st.subheader("📋 Food Diary")
-
-food_diary_day = st.date_input(
-    "Food diary date",
-    value=date.today(),
-    key="food_diary_day"
-)
-food_entries = get_food_entries(user_id, food_diary_day)
-
-if food_entries:
-    st.metric(
-        f"Food calories on {food_diary_day.strftime('%d %b %Y')}",
-        f"{sum(float(e['calories']) for e in food_entries):.1f} kcal"
-    )
-    dm1, dm2, dm3 = st.columns(3)
-    dm1.metric(
-        "Protein",
-        f"{sum(float(e.get('protein_g') or 0) for e in food_entries):.1f} g"
-    )
-    dm2.metric(
-        "Fat",
-        f"{sum(float(e.get('fat_g') or 0) for e in food_entries):.1f} g"
-    )
-    dm3.metric(
-        "Carbs",
-        f"{sum(float(e.get('carbs_g') or 0) for e in food_entries):.1f} g"
-    )
-
-    for entry in food_entries:
-        title = (
-            f"{entry['food_name']} — {entry['quantity_g']:.0f} g — "
-            f"{entry['calories']:.1f} kcal"
-        )
-
-        with st.expander(title):
-            st.caption(
-                f"Source: {entry['source']} · Added: "
-                f"{entry['created_at'][:16].replace('T', ' ')}"
-            )
-            st.write(
-                f"**Protein:** {float(entry.get('protein_g') or 0):.1f} g · "
-                f"**Fat:** {float(entry.get('fat_g') or 0):.1f} g · "
-                f"**Carbs:** {float(entry.get('carbs_g') or 0):.1f} g"
-            )
-
-            with st.form(f"edit_food_form_{entry['id']}"):
-                edit_quantity = st.number_input(
-                    "Edit quantity (grams)",
-                    min_value=0.1,
-                    max_value=10000.0,
-                    value=float(entry["quantity_g"]),
-                    step=1.0,
-                    key=f"edit_food_qty_{entry['id']}"
-                )
-
-                edit_type = st.selectbox(
-                    "Quantity type",
-                    ["Grams (g)", "Units (pieces)"],
-                    index=(
-                        0 if entry["quantity_type"] == "Grams (g)"
-                        else 1
-                    ),
-                    key=f"edit_food_type_{entry['id']}"
-                )
-
-                edit_count = st.number_input(
-                    "Number of pieces (if applicable)",
-                    min_value=0.0,
-                    max_value=1000.0,
-                    value=float(entry["unit_count"]),
-                    step=1.0,
-                    key=f"edit_food_count_{entry['id']}"
-                )
-
-                edit_weight = st.number_input(
-                    "Weight per piece in grams (if applicable)",
-                    min_value=0.0,
-                    max_value=5000.0,
-                    value=float(entry["unit_weight"]),
-                    step=1.0,
-                    key=f"edit_food_weight_{entry['id']}"
-                )
-
-                st.caption(
-                    "Macros per 100 g (use this to fill in protein, fat and "
-                    "carbs for entries logged before macros were tracked)."
-                )
-                em1, em2, em3 = st.columns(3)
-                with em1:
-                    edit_protein100 = st.number_input(
-                        "Protein / 100 g",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(entry.get("protein_per_100g") or 0),
+                    body_weight_kg = st.number_input(
+                        "Your body weight (kg) — used for calorie estimate",
+                        min_value=20.0,
+                        max_value=300.0,
+                        value=78.0,
                         step=0.5,
-                        key=f"edit_food_protein_{entry['id']}"
-                    )
-                with em2:
-                    edit_fat100 = st.number_input(
-                        "Fat / 100 g",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(entry.get("fat_per_100g") or 0),
-                        step=0.5,
-                        key=f"edit_food_fat_{entry['id']}"
-                    )
-                with em3:
-                    edit_carbs100 = st.number_input(
-                        "Carbs / 100 g",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(entry.get("carbs_per_100g") or 0),
-                        step=0.5,
-                        key=f"edit_food_carbs_{entry['id']}"
+                        key="api_body_weight"
                     )
 
-                save_food_edit = st.form_submit_button(
-                    "Save quantity changes"
-                )
+                    if exercise_category == "Strength Training":
+                        st.caption(
+                            "Record the resistance/load, sets and reps below. "
+                            "API Ninjas estimates calorie burn using body weight "
+                            "and workout duration; lifted load and reps are "
+                            "saved in your diary but are not inputs to its "
+                            "calorie formula."
+                        )
+                        s1, s2, s3 = st.columns(3)
+                        with s1:
+                            lifted_weight_kg = st.number_input(
+                                "Weight lifted (kg)",
+                                min_value=0.0,
+                                max_value=1000.0,
+                                value=20.0,
+                                step=1.0,
+                                key="api_lifted_weight"
+                            )
+                        with s2:
+                            sets_count = st.number_input(
+                                "Sets",
+                                min_value=1,
+                                max_value=100,
+                                value=3,
+                                step=1,
+                                key="api_strength_sets"
+                            )
+                        with s3:
+                            reps_count = st.number_input(
+                                "Reps per set",
+                                min_value=1,
+                                max_value=500,
+                                value=12,
+                                step=1,
+                                key="api_strength_reps"
+                            )
 
-            if save_food_edit:
-                if edit_type == "Units (pieces)":
-                    if edit_count <= 0 or edit_weight <= 0:
-                        st.error(
-                            "Enter a positive piece count and piece weight."
+                        duration_minutes = st.number_input(
+                            "Total workout duration (minutes, including rests)",
+                            min_value=1,
+                            max_value=600,
+                            value=45,
+                            step=5,
+                            key="api_strength_duration"
                         )
                     else:
-                        final_qty = edit_count * edit_weight
-                        update_food(
-                            user_id, entry["id"], final_qty,
-                            edit_type, edit_count, edit_weight,
-                            edit_protein100, edit_fat100, edit_carbs100
+                        lifted_weight_kg = 0.0
+                        sets_count = 0
+                        reps_count = 0
+                        duration_minutes = st.number_input(
+                            "Cardio duration (minutes)",
+                            min_value=1,
+                            max_value=600,
+                            value=30,
+                            step=5,
+                            key="api_cardio_duration"
                         )
-                        st.success("Food quantity updated.")
-                        st.rerun()
+
+                    if st.button(
+                        "Calculate calories burned",
+                        type="primary",
+                        key="calculate_api_exercise"
+                    ):
+                        try:
+                            with st.spinner(
+                                "Calculating estimated calories burned..."
+                            ):
+                                estimate = estimate_ninjas_calories(
+                                    chosen_exercise_name,
+                                    body_weight_kg,
+                                    duration_minutes,
+                                    ninjas_api_key
+                                )
+
+                            st.session_state["pending_exercise"] = {
+                                "exercise_name": estimate["matched_name"],
+                                "category": exercise_category,
+                                "duration_minutes": duration_minutes,
+                                "body_weight_kg": body_weight_kg,
+                                "lifted_weight_kg": lifted_weight_kg,
+                                "sets": sets_count,
+                                "reps": reps_count,
+                                "calories_burned": estimate["calories"],
+                                "source": "API Ninjas"
+                            }
+                        except requests.exceptions.HTTPError as exc:
+                            status = (
+                                exc.response.status_code
+                                if exc.response is not None else None
+                            )
+                            if status in (401, 403):
+                                st.error(
+                                    "API Ninjas rejected the key or access "
+                                    "to this endpoint."
+                                )
+                            elif status == 429:
+                                st.error(
+                                    "API Ninjas rate limit/quota reached. "
+                                    "Try later or enter the exercise manually."
+                                )
+                            else:
+                                st.error(f"API request failed: {exc}")
+                        except Exception as exc:
+                            st.error(f"Could not calculate calories: {exc}")
+
+                    pending = st.session_state.get("pending_exercise")
+                    if pending:
+                        st.divider()
+                        st.metric(
+                            "Estimated calories burned",
+                            f"{pending['calories_burned']:.0f} kcal"
+                        )
+                        st.caption(
+                            f"API activity match: {pending['exercise_name']} · "
+                            f"{pending['duration_minutes']} minutes"
+                        )
+                        save_col, cancel_col = st.columns(2)
+
+                        with save_col:
+                            if st.button(
+                                "Save exercise to diary",
+                                type="primary",
+                                use_container_width=True,
+                                key="save_api_exercise"
+                            ):
+                                try:
+                                    add_exercise(
+                                        user_id=user_id,
+                                        exercise_name=pending["exercise_name"],
+                                        category=pending["category"],
+                                        duration_minutes=pending["duration_minutes"],
+                                        body_weight_kg=pending["body_weight_kg"],
+                                        lifted_weight_kg=pending["lifted_weight_kg"],
+                                        sets=pending["sets"],
+                                        reps=pending["reps"],
+                                        calories_burned=pending["calories_burned"],
+                                        source=pending["source"]
+                                    )
+                                    del st.session_state["pending_exercise"]
+                                    st.success("Exercise saved to your diary.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Could not save exercise: {exc}")
+
+                        with cancel_col:
+                            if st.button(
+                                "Discard estimate",
+                                use_container_width=True,
+                                key="discard_api_exercise"
+                            ):
+                                del st.session_state["pending_exercise"]
+                                st.rerun()
+
                 else:
-                    update_food(
-                        user_id, entry["id"], edit_quantity,
-                        edit_type, 0, 0,
-                        edit_protein100, edit_fat100, edit_carbs100
+                    st.warning(
+                        "No matching exercise found. Try a shorter or more "
+                        "general search term, or use manual entry."
                     )
-                    st.success("Food quantity updated.")
-                    st.rerun()
 
-            copy_food_date = st.date_input(
-                "Copy this food entry to date",
-                value=food_diary_day + timedelta(days=1),
-                key=f"copy_food_date_{entry['id']}"
-            )
-            if st.button(
-                "📄 Copy this food entry",
-                key=f"copy_food_{entry['id']}"
-            ):
-                if copy_food_date == food_diary_day:
-                    st.error("Choose a different destination date.")
-                elif copy_food_entry(user_id, entry["id"], copy_food_date):
-                    st.success(f"Food entry copied to {copy_food_date.strftime('%d %b %Y')}.")
-                    st.rerun()
-                else:
-                    st.error("Could not find this food entry to copy.")
+            else:
+                st.caption(
+                    "Type at least two characters to search the API Ninjas "
+                    "exercise catalogue."
+                )
 
-            if st.button(
-                "🗑️ Delete food entry",
-                key=f"delete_food_{entry['id']}"
-            ):
-                delete_food(user_id, entry["id"])
-                st.success("Food entry deleted.")
-                st.rerun()
-else:
-    st.info("No food entries for this date.")
-
-
-# ============================================================
-# EXERCISE DIARY - VIEW / DELETE
-# ============================================================
-st.divider()
-st.subheader("🏃 Exercise Diary")
-
-exercise_diary_day = st.date_input(
-    "Exercise diary date",
-    value=date.today(),
-    key="exercise_diary_day"
-)
-exercise_entries = get_exercise_entries(
-    user_id, exercise_diary_day
-)
-
-if exercise_entries:
-    st.metric(
-        f"Exercise calories on {exercise_diary_day.strftime('%d %b %Y')}",
-        f"{sum(float(e['calories_burned']) for e in exercise_entries):.1f} kcal"
-    )
-
-    for entry in exercise_entries:
-        title = (
-            f"{entry['exercise_name']} — "
-            f"{entry['calories_burned']:.1f} kcal burned"
+    else:
+        st.write(
+            "Use this option if an exercise is unavailable through the API, "
+            "or if you have a calorie value from a watch or another source."
         )
 
-        with st.expander(title):
-            st.write(f"**Category:** {entry['category']}")
-            st.write(
-                f"**Duration:** {entry['duration_minutes']:.0f} minutes"
+        with st.form("manual_exercise_form"):
+            manual_exercise_name = st.text_input(
+                "Exercise name",
+                placeholder="Example: Barbell squat, treadmill walk"
             )
-            st.write(
-                f"**Body weight used for estimate:** "
-                f"{entry['body_weight_kg']:.1f} kg"
+            manual_category = st.selectbox(
+                "Category",
+                ["Strength Training", "Cardio", "Sports", "Other"]
             )
 
-            if entry["category"] == "Strength Training":
-                st.write(
-                    f"**Weight lifted:** {entry['lifted_weight_kg']:.1f} kg"
+            manual_body_weight = st.number_input(
+                "Your body weight (kg)",
+                min_value=0.0,
+                max_value=300.0,
+                value=78.0,
+                step=0.5
+            )
+
+            manual_duration = st.number_input(
+                "Duration (minutes)",
+                min_value=0.0,
+                max_value=1000.0,
+                value=45.0,
+                step=5.0
+            )
+
+            manual_lift_col1, manual_lift_col2, manual_lift_col3 = st.columns(3)
+            with manual_lift_col1:
+                manual_lifted_weight = st.number_input(
+                    "Weight lifted (kg)",
+                    min_value=0.0,
+                    max_value=1000.0,
+                    value=0.0,
+                    step=1.0
                 )
-                st.write(
-                    f"**Sets × reps:** {entry['sets']} × {entry['reps']}"
+            with manual_lift_col2:
+                manual_sets = st.number_input(
+                    "Sets",
+                    min_value=0,
+                    max_value=100,
+                    value=0,
+                    step=1
+                )
+            with manual_lift_col3:
+                manual_reps = st.number_input(
+                    "Reps per set",
+                    min_value=0,
+                    max_value=500,
+                    value=0,
+                    step=1
                 )
 
-            st.write(f"**Source:** {entry['source']}")
-            st.caption(
-                f"Added: {entry['created_at'][:16].replace('T', ' ')}"
+            manual_burned = st.number_input(
+                "Calories burned (kcal)",
+                min_value=0.0,
+                max_value=10000.0,
+                value=100.0,
+                step=5.0
             )
 
-            copy_exercise_date = st.date_input(
-                "Copy this exercise entry to date",
-                value=exercise_diary_day + timedelta(days=1),
-                key=f"copy_exercise_date_{entry['id']}"
+            manual_exercise_submit = st.form_submit_button(
+                "Save manual exercise", type="primary"
             )
-            if st.button(
-                "📄 Copy this exercise entry",
-                key=f"copy_exercise_{entry['id']}"
-            ):
-                if copy_exercise_date == exercise_diary_day:
-                    st.error("Choose a different destination date.")
-                elif copy_exercise_entry(user_id, entry["id"], copy_exercise_date):
-                    st.success(f"Exercise entry copied to {copy_exercise_date.strftime('%d %b %Y')}.")
+
+        if manual_exercise_submit:
+            if not manual_exercise_name.strip():
+                st.error("Please enter an exercise name.")
+            elif manual_burned < 0:
+                st.error("Calories burned cannot be negative.")
+            else:
+                try:
+                    add_exercise(
+                        user_id=user_id,
+                        exercise_name=manual_exercise_name,
+                        category=manual_category,
+                        duration_minutes=manual_duration,
+                        body_weight_kg=manual_body_weight,
+                        lifted_weight_kg=manual_lifted_weight,
+                        sets=manual_sets,
+                        reps=manual_reps,
+                        calories_burned=manual_burned,
+                        source="Manual"
+                    )
+                    st.success("Manual exercise saved.")
                     st.rerun()
-                else:
-                    st.error("Could not find this exercise entry to copy.")
+                except Exception as exc:
+                    st.error(f"Could not save exercise: {exc}")
 
-            if st.button(
-                "🗑️ Delete exercise entry",
-                key=f"delete_exercise_{entry['id']}"
-            ):
-                delete_exercise(user_id, entry["id"])
-                st.success("Exercise entry deleted.")
-                st.rerun()
-else:
-    st.info("No exercise entries for this date.")
+    # --------------------------------------------------------
+    # EXERCISE DIARY - VIEW / DELETE
+    # --------------------------------------------------------
+    st.divider()
+    st.subheader("🏃 Exercise Diary")
 
-
-# ============================================================
-# COPY FOOD + EXERCISE ENTRIES BETWEEN DATES
-# ============================================================
-st.divider()
-st.subheader("📋 Copy Entries to Another Date")
-st.caption("Copies all food and exercise entries from the selected source date. Original entries remain unchanged.")
-with st.form("copy_entries_form"):
-    copy_source_day = st.date_input("Copy entries from", value=date.today(), key="copy_source_day")
-    copy_destination_day = st.date_input("Copy entries to", value=date.today() + timedelta(days=1), key="copy_destination_day")
-    copy_confirm = st.checkbox("I understand this will add duplicate entries to the destination date.")
-    copy_submit = st.form_submit_button("Copy food and exercise entries", type="primary")
-if copy_submit:
-    if not copy_confirm:
-        st.warning("Please confirm before copying.")
-    elif copy_source_day == copy_destination_day:
-        st.error("Choose two different dates.")
-    else:
-        try:
-            food_copied, exercise_copied = copy_day_entries(user_id, copy_source_day, copy_destination_day)
-            st.success(f"Copied {food_copied} food entries and {exercise_copied} exercise entries to {copy_destination_day.strftime('%d %b %Y')}. Originals were kept.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Could not copy entries: {exc}")
-
-
-# ============================================================
-# WEIGHT LOG
-# ============================================================
-st.divider()
-st.header("⚖️ Weight Log")
-st.caption("Record your body weight over time. These records are separate from the weight used by the exercise calorie estimator.")
-with st.form("add_weight_form", clear_on_submit=True):
-    weight_col1, weight_col2 = st.columns(2)
-    with weight_col1:
-        new_weight = st.number_input("Weight (kg)", min_value=1.0, max_value=500.0, value=84.0, step=0.1)
-    with weight_col2:
-        weight_day = st.date_input("Date", value=date.today())
-    weight_notes = st.text_input("Notes (optional)", placeholder="Morning, before breakfast, etc.")
-    weight_submit = st.form_submit_button("Save weight", type="primary")
-if weight_submit:
-    try:
-        add_weight(user_id, new_weight, weight_day, weight_notes)
-        st.success("Weight saved.")
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Could not save weight: {exc}")
-
-weight_rows = get_weights(user_id)
-if weight_rows:
-    weight_df = pd.DataFrame(weight_rows)
-    weight_df["entry_date"] = pd.to_datetime(weight_df["entry_date"])
-    chronological = weight_df.sort_values(["entry_date", "id"])
-    first_weight = float(chronological.iloc[0]["weight_kg"])
-    latest_weight = float(chronological.iloc[-1]["weight_kg"])
-    lowest_weight = float(weight_df["weight_kg"].min())
-    wc1, wc2, wc3 = st.columns(3)
-    wc1.metric("Latest weight", f"{latest_weight:.1f} kg")
-    wc2.metric("Change since first log", f"{latest_weight-first_weight:+.1f} kg")
-    wc3.metric("Lowest recorded", f"{lowest_weight:.1f} kg")
-    chart = chronological.set_index("entry_date")[["weight_kg"]]
-    st.line_chart(chart)
-    st.subheader("Weight history records")
-    for wr in weight_rows:
-        weight_date = wr["entry_date"]
-        with st.expander(f"{weight_date.strftime('%d %b %Y')} — {float(wr['weight_kg']):.1f} kg"):
-            with st.form(f"edit_weight_{wr['id']}"):
-                edit_w1, edit_w2 = st.columns(2)
-                with edit_w1:
-                    edited_weight = st.number_input("Weight (kg)", min_value=1.0, max_value=500.0, value=float(wr["weight_kg"]), step=0.1, key=f"weight_value_{wr['id']}")
-                with edit_w2:
-                    edited_day = st.date_input("Date", value=weight_date, key=f"weight_date_{wr['id']}")
-                edited_notes = st.text_input("Notes", value=wr["notes"] or "", key=f"weight_notes_{wr['id']}")
-                save_weight = st.form_submit_button("Save changes")
-            if save_weight:
-                update_weight(user_id, wr["id"], edited_weight, edited_day, edited_notes)
-                st.success("Weight record updated.")
-                st.rerun()
-            if st.button("Delete weight record", key=f"delete_weight_{wr['id']}"):
-                delete_weight(user_id, wr["id"])
-                st.success("Weight record deleted.")
-                st.rerun()
-else:
-    st.info("No weight records yet. Add your first measurement above.")
-
-
-# ============================================================
-# COMBINED HISTORY
-# ============================================================
-st.divider()
-st.subheader("📅 Combined Calorie History — Last 10 Days")
-
-history = get_history(user_id, days=10)
-
-if history:
-    history_df = pd.DataFrame(history)
-    for col in [
-        "Maintenance calories", "Calories consumed", "Calories burned",
-        "Current weight (kg)", "Deficit / surplus",
-        "Protein (g)", "Fat (g)", "Carbs (g)"
-    ]:
-        history_df[col] = pd.to_numeric(history_df[col], errors="coerce").round(1)
-
-    st.dataframe(
-        history_df,
-        use_container_width=True,
-        hide_index=True
+    exercise_diary_day = st.date_input(
+        "Exercise diary date",
+        value=date.today(),
+        key="exercise_diary_day"
+    )
+    exercise_entries = get_exercise_entries(
+        user_id, exercise_diary_day
     )
 
-    chart_df = history_df.set_index("Date")[
-        ["Maintenance calories", "Calories consumed", "Calories burned", "Deficit / surplus"]
-    ]
-    st.bar_chart(chart_df)
+    if exercise_entries:
+        st.metric(
+            f"Exercise calories on {exercise_diary_day.strftime('%d %b %Y')}",
+            f"{sum(float(e['calories_burned']) for e in exercise_entries):.1f} kcal"
+        )
 
-    st.caption("Daily macronutrients (g)")
-    macro_chart_df = history_df.set_index("Date")[
-        ["Protein (g)", "Fat (g)", "Carbs (g)"]
-    ]
-    st.bar_chart(macro_chart_df)
-else:
-    st.info("Your combined food and exercise history will appear here.")
+        for entry in exercise_entries:
+            title = (
+                f"{entry['exercise_name']} — "
+                f"{entry['calories_burned']:.1f} kcal burned"
+            )
+
+            with st.expander(title):
+                st.write(f"**Category:** {entry['category']}")
+                st.write(
+                    f"**Duration:** {entry['duration_minutes']:.0f} minutes"
+                )
+                st.write(
+                    f"**Body weight used for estimate:** "
+                    f"{entry['body_weight_kg']:.1f} kg"
+                )
+
+                if entry["category"] == "Strength Training":
+                    st.write(
+                        f"**Weight lifted:** {entry['lifted_weight_kg']:.1f} kg"
+                    )
+                    st.write(
+                        f"**Sets × reps:** {entry['sets']} × {entry['reps']}"
+                    )
+
+                st.write(f"**Source:** {entry['source']}")
+                st.caption(
+                    f"Added: {entry['created_at'][:16].replace('T', ' ')}"
+                )
+
+                copy_exercise_date = st.date_input(
+                    "Copy this exercise entry to date",
+                    value=exercise_diary_day + timedelta(days=1),
+                    key=f"copy_exercise_date_{entry['id']}"
+                )
+                if st.button(
+                    "📄 Copy this exercise entry",
+                    key=f"copy_exercise_{entry['id']}"
+                ):
+                    if copy_exercise_date == exercise_diary_day:
+                        st.error("Choose a different destination date.")
+                    elif copy_exercise_entry(user_id, entry["id"], copy_exercise_date):
+                        st.success(f"Exercise entry copied to {copy_exercise_date.strftime('%d %b %Y')}.")
+                        st.rerun()
+                    else:
+                        st.error("Could not find this exercise entry to copy.")
+
+                if st.button(
+                    "🗑️ Delete exercise entry",
+                    key=f"delete_exercise_{entry['id']}"
+                ):
+                    delete_exercise(user_id, entry["id"])
+                    st.success("Exercise entry deleted.")
+                    st.rerun()
+    else:
+        st.info("No exercise entries for this date.")
+
+
+# ============================================================
+# TAB 3: WEIGHT LOG
+# ============================================================
+with tab_weight:
+    st.header("⚖️ Weight Log")
+    st.caption("Record your body weight over time. These records are separate from the weight used by the exercise calorie estimator.")
+    with st.form("add_weight_form", clear_on_submit=True):
+        weight_col1, weight_col2 = st.columns(2)
+        with weight_col1:
+            new_weight = st.number_input("Weight (kg)", min_value=1.0, max_value=500.0, value=84.0, step=0.1)
+        with weight_col2:
+            weight_day = st.date_input("Date", value=date.today())
+        weight_notes = st.text_input("Notes (optional)", placeholder="Morning, before breakfast, etc.")
+        weight_submit = st.form_submit_button("Save weight", type="primary")
+    if weight_submit:
+        try:
+            add_weight(user_id, new_weight, weight_day, weight_notes)
+            st.success("Weight saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not save weight: {exc}")
+
+    weight_rows = get_weights(user_id)
+    if weight_rows:
+        weight_df = pd.DataFrame(weight_rows)
+        weight_df["entry_date"] = pd.to_datetime(weight_df["entry_date"])
+        chronological = weight_df.sort_values(["entry_date", "id"])
+        first_weight = float(chronological.iloc[0]["weight_kg"])
+        latest_weight = float(chronological.iloc[-1]["weight_kg"])
+        lowest_weight = float(weight_df["weight_kg"].min())
+        wc1, wc2, wc3 = st.columns(3)
+        wc1.metric("Latest weight", f"{latest_weight:.1f} kg")
+        wc2.metric("Change since first log", f"{latest_weight-first_weight:+.1f} kg")
+        wc3.metric("Lowest recorded", f"{lowest_weight:.1f} kg")
+        chart = chronological.set_index("entry_date")[["weight_kg"]]
+        st.line_chart(chart)
+        st.subheader("Weight history records")
+        for wr in weight_rows:
+            weight_date = wr["entry_date"]
+            with st.expander(f"{weight_date.strftime('%d %b %Y')} — {float(wr['weight_kg']):.1f} kg"):
+                with st.form(f"edit_weight_{wr['id']}"):
+                    edit_w1, edit_w2 = st.columns(2)
+                    with edit_w1:
+                        edited_weight = st.number_input("Weight (kg)", min_value=1.0, max_value=500.0, value=float(wr["weight_kg"]), step=0.1, key=f"weight_value_{wr['id']}")
+                    with edit_w2:
+                        edited_day = st.date_input("Date", value=weight_date, key=f"weight_date_{wr['id']}")
+                    edited_notes = st.text_input("Notes", value=wr["notes"] or "", key=f"weight_notes_{wr['id']}")
+                    save_weight = st.form_submit_button("Save changes")
+                if save_weight:
+                    update_weight(user_id, wr["id"], edited_weight, edited_day, edited_notes)
+                    st.success("Weight record updated.")
+                    st.rerun()
+                if st.button("Delete weight record", key=f"delete_weight_{wr['id']}"):
+                    delete_weight(user_id, wr["id"])
+                    st.success("Weight record deleted.")
+                    st.rerun()
+    else:
+        st.info("No weight records yet. Add your first measurement above.")
+
+
+# ============================================================
+# TAB 4: COPY FOOD + EXERCISE ENTRIES BETWEEN DATES
+# ============================================================
+with tab_copy:
+    st.subheader("📋 Copy Entries to Another Date")
+    st.caption("Copies all food and exercise entries from the selected source date. Original entries remain unchanged.")
+    with st.form("copy_entries_form"):
+        copy_source_day = st.date_input("Copy entries from", value=date.today(), key="copy_source_day")
+        copy_destination_day = st.date_input("Copy entries to", value=date.today() + timedelta(days=1), key="copy_destination_day")
+        copy_confirm = st.checkbox("I understand this will add duplicate entries to the destination date.")
+        copy_submit = st.form_submit_button("Copy food and exercise entries", type="primary")
+    if copy_submit:
+        if not copy_confirm:
+            st.warning("Please confirm before copying.")
+        elif copy_source_day == copy_destination_day:
+            st.error("Choose two different dates.")
+        else:
+            try:
+                food_copied, exercise_copied = copy_day_entries(user_id, copy_source_day, copy_destination_day)
+                st.success(f"Copied {food_copied} food entries and {exercise_copied} exercise entries to {copy_destination_day.strftime('%d %b %Y')}. Originals were kept.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not copy entries: {exc}")
+
+
+# ============================================================
+# TAB 5: COMBINED HISTORY
+# ============================================================
+with tab_history:
+    st.subheader("📅 Combined Calorie History — Last 10 Days")
+
+    history = get_history(user_id, days=10)
+
+    if history:
+        history_df = pd.DataFrame(history)
+        for col in [
+            "Maintenance calories", "Calories consumed", "Calories burned",
+            "Current weight (kg)", "Deficit / surplus",
+            "Protein (g)", "Fat (g)", "Carbs (g)"
+        ]:
+            history_df[col] = pd.to_numeric(history_df[col], errors="coerce").round(1)
+
+        st.dataframe(
+            history_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        chart_df = history_df.set_index("Date")[
+            ["Maintenance calories", "Calories consumed", "Calories burned", "Deficit / surplus"]
+        ]
+        st.bar_chart(chart_df)
+
+        st.caption("Daily macronutrients (g)")
+        macro_chart_df = history_df.set_index("Date")[
+            ["Protein (g)", "Fat (g)", "Carbs (g)"]
+        ]
+        st.bar_chart(macro_chart_df)
+    else:
+        st.info("Your combined food and exercise history will appear here.")
 
 
 # ============================================================
